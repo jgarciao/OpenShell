@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# cargo-nextest requires a profile config to emit JUnit XML output.
+# Without this, nextest only prints to stdout — no xunit file is produced.
+# Used by the openshell-e2e container image: --profile ci
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+path = "xunit_report.xml"
+report-name = "openshell-e2e"

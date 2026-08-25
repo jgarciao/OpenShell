@@ -3,7 +3,7 @@
 .gitignore
 
 # Rust build artifacts (use BuildKit cache mounts instead)
-target
+**/target
 
 # Python
 __pycache__

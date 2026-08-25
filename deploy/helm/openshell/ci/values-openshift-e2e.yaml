@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Temporary OpenShift E2E overlay — clears UID/GID overrides so the gateway
+# pod runs under OpenShift's security context constraints. This file is used
+# by the openshell-e2e container entrypoint until PR #2885 adds proper SCC
+# support to the Helm chart.
+
+podSecurityContext:
+  fsGroup: null
+
+securityContext:
+  runAsUser: null

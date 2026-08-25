@@ -1,0 +1,145 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Multi-stage Dockerfile for the openshell-e2e integration test runner.
+# Uses a configurable CLI image as the runtime base and pre-compiled Rust
+# test binaries via a nextest archive.
+#
+# Build:
+#   mise run e2e:image:build
+#
+# Run (upstream images):
+#   podman run --rm -t --network host \
+#     -v ~/.kube/config:/home/runner/.kube/config:z,ro \
+#     -v ./results:/results:z \
+#     -e OPENSHELL_GATEWAY_IMAGE=ghcr.io/nvidia/openshell/gateway:latest \
+#     -e OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest \
+#     openshell-e2e:dev e2e-kubernetes smoke
+#
+# Run (ODH images, digest):
+#   podman run --rm -t --network host \
+#     -v ~/.kube/config:/home/runner/.kube/config:z,ro \
+#     -v ./results:/results:z \
+#     -e OPENSHELL_GATEWAY_IMAGE=quay.io/opendatahub/odh-openshell-gateway@sha256:abc... \
+#     -e OPENSHELL_SUPERVISOR_IMAGE=quay.io/opendatahub/odh-openshell-supervisor@sha256:abc... \
+#     openshell-e2e:dev e2e-kubernetes
+
+# Defaults match mise.toml; overridden by --build-arg from `mise run e2e:image:build`.
+ARG RUST_VERSION=1.95.0
+ARG OPENSHELL_CLI_IMAGE=quay.io/opendatahub/odh-openshell-cli:odh-stable
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build Rust E2E nextest archive
+# ---------------------------------------------------------------------------
+
+FROM rust:${RUST_VERSION}-bookworm AS rust-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libz3-dev clang libclang-dev pkg-config libssl-dev cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG NEXTEST_VERSION=0.9.104
+RUN curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/linux" | tar xzf - -C /usr/local/bin
+
+WORKDIR /build
+COPY . .
+
+RUN cargo nextest archive \
+      --manifest-path e2e/rust/Cargo.toml \
+      --features "e2e,e2e-kubernetes" \
+      --archive-file /tmp/e2e-tests.tar.zst
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime image (CLI base)
+# ---------------------------------------------------------------------------
+
+FROM ${OPENSHELL_CLI_IMAGE} AS runtime
+
+USER 0
+
+ARG KUBECTL_VERSION=v1.36.1
+ARG HELM_VERSION=v4.2.0
+ARG OC_VERSION=5.0.0-okd-scos.ec.7
+ARG NEXTEST_VERSION=0.9.104
+ARG UV_VERSION=0.10.12
+
+# System packages
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
+      python3.12 python3.12-pip \
+      jq tar gzip git findutils procps-ng \
+    && microdnf clean all \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && ln -sf /usr/bin/pip3.12 /usr/bin/pip3
+
+# kubectl
+RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+      -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/kubectl
+
+# helm
+RUN curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+      | tar xzf - --strip-components=1 -C /usr/local/bin linux-amd64/helm
+
+# oc CLI
+RUN curl -fsSL "https://github.com/okd-project/okd/releases/download/${OC_VERSION}/openshift-client-linux-amd64-rhel9-${OC_VERSION}.tar.gz" \
+      | tar xzf - -C /usr/local/bin oc \
+    && chmod +x /usr/local/bin/oc
+
+# uv (Python package manager)
+RUN pip3 install --no-cache-dir "uv==${UV_VERSION}"
+
+# cargo-nextest (for running pre-compiled Rust tests)
+RUN curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/linux" \
+      | tar xzf - -C /usr/local/bin
+
+# ---------------------------------------------------------------------------
+# Application files
+# ---------------------------------------------------------------------------
+
+WORKDIR /app
+
+# Nextest archive from builder
+COPY --chown=1001:0 --from=rust-builder /tmp/e2e-tests.tar.zst /app/e2e-tests.tar.zst
+
+# E2E source for workspace-remap (nextest needs the source tree for test names)
+COPY --chown=1001:0 e2e/rust/ /app/e2e-source/
+
+# Helm chart
+COPY --chown=1001:0 deploy/helm/openshell/ /app/deploy/helm/openshell/
+
+# E2E orchestration and support scripts
+COPY --chown=1001:0 e2e/with-kube-gateway.sh /app/e2e/with-kube-gateway.sh
+COPY --chown=1001:0 e2e/support/ /app/e2e/support/
+COPY --chown=1001:0 e2e/kubernetes/ /app/e2e/kubernetes/
+COPY --chown=1001:0 e2e/openshell-e2e/ /app/e2e/openshell-e2e/
+RUN chmod +x /app/e2e/with-kube-gateway.sh \
+    && chmod +x /app/e2e/support/*.sh \
+    && chmod +x /app/e2e/openshell-e2e/*.sh
+
+# Python SDK and E2E tests
+COPY --chown=1001:0 python/ /app/python/
+COPY --chown=1001:0 e2e/python/ /app/e2e/python/
+COPY --chown=1001:0 pyproject.toml uv.lock /app/
+
+# Install Python dependencies (without building the root maturin package)
+RUN cd /app && uv sync --no-install-project --frozen 2>/dev/null \
+    || uv sync --no-install-project 2>/dev/null \
+    || pip3 install --no-cache-dir grpcio protobuf httpx cloudpickle \
+       pytest pytest-asyncio pytest-xdist
+
+# ---------------------------------------------------------------------------
+# Runtime environment
+# ---------------------------------------------------------------------------
+
+ENV OPENSHELL_BIN=/usr/local/bin/openshell
+ENV PYTHONPATH=/app/python
+ENV HOME=/home/runner
+
+RUN mkdir -p /home/runner /results \
+    && chown -R 1001:0 /home/runner /results \
+    && chmod -R g=u /home/runner /results
+
+USER 1001
+
+ENTRYPOINT ["/app/e2e/openshell-e2e/entrypoint.sh"]

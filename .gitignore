@@ -236,3 +236,7 @@ scripts/lint-mermaid/node_modules/
 # Nix
 /result
 /result-*
+
+# E2E JUnit XML output (local podman/mise runs)
+/e2e-results/
+/results/

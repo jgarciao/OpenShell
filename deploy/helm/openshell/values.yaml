@@ -25,6 +25,8 @@ image:
   pullPolicy: IfNotPresent
   # -- Gateway image tag. Defaults to the chart appVersion when empty.
   tag: ""
+  # -- Gateway image digest (e.g. sha256:abc123...). When set, takes precedence over tag.
+  digest: ""
 
 # Supervisor image for the openshell-sandbox binary injected into sandbox pods.
 # The default repository and empty tag use the version-pinned image built into
@@ -37,6 +39,8 @@ supervisor:
     pullPolicy: ""
     # -- Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed.
     tag: ""
+    # -- Supervisor image digest (e.g. sha256:abc123...). When set, takes precedence over tag.
+    digest: ""
   # -- How the supervisor binary is delivered into sandbox pods.
   # Empty (default) = auto-detect from cluster version:
   #   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)

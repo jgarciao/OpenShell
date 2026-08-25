@@ -234,3 +234,42 @@ run = "e2e/rust/e2e-docker.sh"
 ["e2e:openshift"]
 description = "Run OpenShift database-backend integration scenarios against a live cluster (requires oc CLI authenticated to an OpenShift cluster)"
 run = "e2e/rust/e2e-openshift.sh"
+
+["e2e:image:build"]
+description = "Build the openshell-e2e container image (optional arg: CLI base image)"
+run = """
+  cli_image="${1:-${OPENSHELL_CLI_IMAGE:-quay.io/opendatahub/odh-openshell-cli:odh-stable}}"
+  podman build -f deploy/docker/Dockerfile.openshell-e2e \
+    --build-arg OPENSHELL_CLI_IMAGE="${cli_image}" \
+    --build-arg RUST_VERSION="$(mise current rust)" \
+    --build-arg KUBECTL_VERSION="v$(mise current kubectl)" \
+    --build-arg HELM_VERSION="v$(mise current helm)" \
+    --build-arg UV_VERSION="$(mise current uv)" \
+    -t openshell-e2e:${IMAGE_TAG:-dev} .
+"""
+
+["e2e:image:run"]
+description = "Run integration tests via podman against a live K8s/OpenShift cluster (args: [suite] [test-filter])"
+run = """
+  _kube_src="${KUBECONFIG:-$HOME/.kube/config}"
+  _kube_tmp="$(mktemp /tmp/openshell-e2e-kubeconfig.XXXXXX)"
+  cp "${_kube_src}" "${_kube_tmp}"
+  chmod 644 "${_kube_tmp}"
+  trap 'rm -f "${_kube_tmp}"' EXIT
+  mkdir -m 777 -p e2e-results
+  podman run --rm -t \
+    --network host \
+    -v "${_kube_tmp}:/home/runner/.kube/config:z,ro" \
+    -v "$(pwd)/e2e-results:/results:z" \
+    ${ENV_FILE:+--env-file "$ENV_FILE"} \
+    -e IMAGE_TAG="${IMAGE_TAG:-latest}" \
+    -e OPENSHELL_REGISTRY="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}" \
+    -e OPENSHELL_GATEWAY_IMAGE="${OPENSHELL_GATEWAY_IMAGE:-}" \
+    -e OPENSHELL_GATEWAY_TAG="${OPENSHELL_GATEWAY_TAG:-}" \
+    -e OPENSHELL_SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-}" \
+    -e OPENSHELL_SUPERVISOR_TAG="${OPENSHELL_SUPERVISOR_TAG:-}" \
+    -e OPENSHELL_E2E_KUBE_EXTRA_VALUES="${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" \
+    -e AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-}" \
+    openshell-e2e:${E2E_IMAGE_TAG:-dev} \
+    "$@"
+"""

@@ -71,11 +71,15 @@ Create the name of the service account assigned to sandbox pods
 {{- end }}
 
 {{/*
-Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
-so a released chart automatically pulls the matching image without extra overrides.
+Gateway image reference. Digest takes precedence over tag; tag falls back to
+.Chart.AppVersion so a released chart automatically pulls the matching image.
 */}}
 {{- define "openshell.image" -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest }}
+{{- else -}}
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
+{{- end -}}
 {{- end }}
 
 {{/* Official supervisor repository used by the gateway's built-in default. */}}
@@ -90,17 +94,22 @@ The chart's documented repository and empty tag are the gateway-owned default.
 {{- define "openshell.supervisorImageOverrideEnabled" -}}
 {{- $defaultRepository := include "openshell.defaultSupervisorRepository" . -}}
 {{- $repository := .Values.supervisor.image.repository | default $defaultRepository -}}
-{{- if or (ne $repository $defaultRepository) .Values.supervisor.image.tag -}}true{{- end -}}
+{{- if or (ne $repository $defaultRepository) .Values.supervisor.image.tag .Values.supervisor.image.digest -}}true{{- end -}}
 {{- end }}
 
 {{/*
-Supervisor image override. A tag-only override uses the official repository;
-a repository-only override uses the effective gateway image tag.
+Supervisor image override. Digest takes precedence over tag. A tag-only override
+uses the official repository; a repository-only override uses the effective
+gateway image tag.
 */}}
 {{- define "openshell.supervisorImage" -}}
 {{- $repository := .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
+{{- if .Values.supervisor.image.digest -}}
+{{- printf "%s@%s" $repository .Values.supervisor.image.digest }}
+{{- else -}}
 {{- $tag := .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
 {{- printf "%s:%s" $repository $tag }}
+{{- end -}}
 {{- end }}
 
 {{/*

@@ -354,10 +354,8 @@ run_scenario() {
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
-    --set "image.repository=${REGISTRY_VALUE}/gateway" \
-    --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${_helm_gw_image_args[@]}" \
+    "${_helm_sv_image_args[@]}" \
     "${helm_post_renderer_args[@]}" \
     "$@" \
     --wait --timeout 5m
@@ -542,6 +540,59 @@ else
   IMAGE_TAG_VALUE="${IMAGE_TAG:-latest}"
 fi
 REGISTRY_VALUE="${REGISTRY_VALUE%/}"
+
+# Parse image references. Accepts repo, repo:tag, or repo@sha256:...
+# Sets _REPO, _TAG, _DIGEST variables for each image.
+_parse_image_ref() {
+  local ref="$1" default_repo="$2" default_tag="$3"
+  _PARSED_REPO="" _PARSED_TAG="" _PARSED_DIGEST=""
+
+  if [ -z "${ref}" ]; then ref="${default_repo}"; fi
+
+  if [[ "${ref}" == *"@sha256:"* ]]; then
+    _PARSED_REPO="${ref%%@sha256:*}"
+    _PARSED_DIGEST="sha256:${ref#*@sha256:}"
+  elif [[ "${ref}" == *":"* ]]; then
+    local tag_part="${ref##*:}"
+    if [[ "${tag_part}" == *"/"* ]]; then
+      _PARSED_REPO="${ref}"
+    else
+      _PARSED_REPO="${ref%:*}"
+      _PARSED_TAG="${tag_part}"
+    fi
+  else
+    _PARSED_REPO="${ref}"
+  fi
+
+  if [ -z "${_PARSED_TAG}" ] && [ -z "${_PARSED_DIGEST}" ]; then
+    _PARSED_TAG="${default_tag}"
+  fi
+}
+
+_parse_image_ref "${OPENSHELL_GATEWAY_IMAGE:-}" "${REGISTRY_VALUE}/gateway" "${IMAGE_TAG_VALUE}"
+_GW_REPO="${_PARSED_REPO}" _GW_TAG="${_PARSED_TAG}" _GW_DIGEST="${_PARSED_DIGEST}"
+
+_parse_image_ref "${OPENSHELL_SUPERVISOR_IMAGE:-}" "${REGISTRY_VALUE}/supervisor" "${IMAGE_TAG_VALUE}"
+_SV_REPO="${_PARSED_REPO}" _SV_TAG="${_PARSED_TAG}" _SV_DIGEST="${_PARSED_DIGEST}"
+
+# Explicit _TAG vars override parsed values (backward compat).
+if [ -n "${OPENSHELL_GATEWAY_TAG:-}" ]; then _GW_TAG="${OPENSHELL_GATEWAY_TAG}"; _GW_DIGEST=""; fi
+if [ -n "${OPENSHELL_SUPERVISOR_TAG:-}" ]; then _SV_TAG="${OPENSHELL_SUPERVISOR_TAG}"; _SV_DIGEST=""; fi
+
+# Build Helm --set flags for each image.
+_helm_gw_image_args=( --set "image.repository=${_GW_REPO}" )
+if [ -n "${_GW_DIGEST}" ]; then
+  _helm_gw_image_args+=( --set "image.digest=${_GW_DIGEST}" )
+else
+  _helm_gw_image_args+=( --set "image.tag=${_GW_TAG}" )
+fi
+
+_helm_sv_image_args=( --set "supervisor.image.repository=${_SV_REPO}" )
+if [ -n "${_SV_DIGEST}" ]; then
+  _helm_sv_image_args+=( --set "supervisor.image.digest=${_SV_DIGEST}" )
+else
+  _helm_sv_image_args+=( --set "supervisor.image.tag=${_SV_TAG}" )
+fi
 
 # Resolve a host-gateway IP that sandbox pods can dial to reach test fixtures
 # running on the developer/CI host (HTTP fixtures bound to 0.0.0.0 plus sibling
@@ -841,10 +892,8 @@ else
     --namespace "${NAMESPACE}" --create-namespace \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
-    --set "image.repository=${REGISTRY_VALUE}/gateway" \
-    --set "image.tag=${IMAGE_TAG_VALUE}" \
-    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${_helm_gw_image_args[@]}" \
+    "${_helm_sv_image_args[@]}" \
     "${helm_extra_args[@]}" \
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
