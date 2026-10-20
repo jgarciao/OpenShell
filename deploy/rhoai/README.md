@@ -105,10 +105,19 @@ The latter supplies a PEM CA bundle for a private OIDC issuer to both releases.
 
 Register `https://<dashboard host>/oauth2/callback` with your IdP. The browser
 client ID is separate from the gateway API audience. Generic OIDC uses
-`allowed_groups`; Keycloak can use `provider: "keycloak-oidc"` and `allowed_roles`
-such as `openshell-api:openshell-user`. These are alternatives, not assumptions
-about customer claim names. Without either UI filter, any authenticated IdP user
-can reach the UI, but the gateway still enforces its roles and workspace access.
+`allowed_groups`; Keycloak can use `provider: "keycloak-oidc"` and `allowed_roles`.
+These are alternatives, not assumptions about customer claim names.
+
+`allowed_roles` filters dashboard login independently of gateway authorization.
+To admit both admin-only and ordinary users, include both roles: for realm roles,
+use `"allowed_roles": ["openshell-admin", "openshell-user"]`. For client roles,
+prefix each role with the Keycloak client ID that defines it, for example
+`"allowed_roles": ["openshell-api-openshell-team:openshell-admin", "openshell-api-openshell-team:openshell-user"]`.
+Replace these example names with your IdP's role and client names. Users need
+at least one listed role, not both; listing only `openshell-user` excludes users
+who have only `openshell-admin`. Without either UI filter, any authenticated IdP
+user can reach the UI, but the gateway still enforces its roles and workspace access.
+
 Optional `oidc.scope` supplies space-separated OAuth scopes including `openid`
 (for example `openid email profile offline_access`). Request only scopes your
 IdP supports; include `groups` if your provider requires it for group claims.
