@@ -182,9 +182,9 @@ uv run --script --python 3.12 deploy/rhoai/install.py \
 ```
 
 This renders both charts, checks the default and selected workspace storage
-classes, checks create/patch permissions for installation resources and update
-permission for Helm release Secrets, verifies Agent Sandbox readiness, and detects
-release/identity conflicts. It reports the
+classes, checks create/patch permissions for installation resources and
+update/delete permissions for Helm release Secrets (including history pruning),
+verifies Agent Sandbox readiness, and detects release/identity conflicts. It reports the
 OpenShift version and node kernels and flags older kernels for runtime validation.
 It does not encode a Red Hat product support matrix or prove storage health,
 RBAC bind/escalate permissions, quota, SCC admission, or application compatibility.

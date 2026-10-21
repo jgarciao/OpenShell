@@ -549,7 +549,8 @@ class Installer:
             for verb in ("create", "patch")
         ]
         # Helm updates its release Secret to record installation/upgrade status.
-        operations.append(("update", "secrets", True))
+        # --history-max also makes Helm delete older release Secrets.
+        operations += [("update", "secrets", True), ("delete", "secrets", True)]
         operations += [
             (verb, resource, False)
             for resource in (

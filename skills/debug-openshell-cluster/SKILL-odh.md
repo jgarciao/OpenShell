@@ -24,7 +24,8 @@ preserving namespace metadata. Use the published
 for the installation entry point. Diagnose Agent Sandbox availability separately;
 the installer does not provision that controller or RHOAI itself.
 Its read-only preflight checks storage, installation permissions (including
-`update secrets` for Helm release storage), and recorded OIDC identities across
+`update secrets` and `delete secrets` for Helm release storage and history
+pruning), and recorded OIDC identities across
 installer-managed namespaces. Distinct gateways need
 distinct audiences and browser clients. Installation rechecks conflicts after
 publishing its identity reservation and before Helm activation. Conflicting

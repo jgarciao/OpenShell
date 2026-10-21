@@ -481,16 +481,18 @@ class InstallTests(unittest.TestCase):
             any(args[:2] == ["helm", "upgrade"] for args, _ in cluster.calls)
         )
 
-    def test_secret_update_permission_is_required_before_any_mutation(self):
-        cluster = self.cluster()
-        cluster.denied_permission = ("update", "secrets")
-        before = copy.deepcopy(cluster.objects)
-        with self.assertRaisesRegex(ValueError, "update secrets"):
-            cluster.install(["g", "d"], ["g", "d"])
-        self.assertEqual(cluster.objects, before)
-        self.assertFalse(
-            any(args[:2] == ["helm", "upgrade"] for args, _ in cluster.calls)
-        )
+    def test_secret_storage_permissions_are_required_before_any_mutation(self):
+        for verb in ("update", "delete"):
+            with self.subTest(verb=verb):
+                cluster = self.cluster()
+                cluster.denied_permission = (verb, "secrets")
+                before = copy.deepcopy(cluster.objects)
+                with self.assertRaisesRegex(ValueError, f"{verb} secrets"):
+                    cluster.install(["g", "d"], ["g", "d"])
+                self.assertEqual(cluster.objects, before)
+                self.assertFalse(
+                    any(args[:2] == ["helm", "upgrade"] for args, _ in cluster.calls)
+                )
 
     def test_uninstalled_other_release_history_does_not_block_install(self):
         cluster = self.cluster()
@@ -787,7 +789,8 @@ class InstallTests(unittest.TestCase):
             self.assertNotIn("a-secret-that", " ".join(args))
             self.assertIn("test-context", args)
             self.assertNotIn("--atomic", args)
-            self.assertNotIn("delete", args)
+            if "can-i" not in args:
+                self.assertNotIn("delete", args)
         data = cluster.objects[("secret", installer.OIDC_SECRET)]["data"]
         self.assertEqual(
             base64.b64decode(data["client-secret"]),
@@ -914,7 +917,10 @@ class InstallTests(unittest.TestCase):
         self.assertIn(("secret", installer.OIDC_SECRET), cluster.objects)
         self.assertIn(("secret", "openshell-client-tls"), cluster.objects)
         self.assertFalse(
-            any("delete" in args or "uninstall" in args for args, _ in cluster.calls)
+            any(
+                "uninstall" in args or ("delete" in args and "can-i" not in args)
+                for args, _ in cluster.calls
+            )
         )
 
     def test_route_admission_waits_and_times_out(self):
