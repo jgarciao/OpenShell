@@ -530,6 +530,9 @@ APPS_DOMAIN="$APPS_DOMAIN" envsubst '${APPS_DOMAIN}' < config.json > config.json
 grep -n '${APPS_DOMAIN}' config.json || echo "OK: all placeholders expanded"
 ```
 
+The `gateway` section configures the `openshell` Helm release; the `dashboard`
+section configures `openshell-dashboard`.
+
 Key fields explained:
 
 | Field | Description |

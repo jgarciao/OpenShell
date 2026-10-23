@@ -182,7 +182,9 @@ cannot be resolved, it warns and continues.
 ## Configuration
 
 Each `config.json` is self-contained. `load_config` resolves `helm_overrides`,
-`oidc.client_secret_file`, and `oidc.ca_file` relative to the config file.
+`oidc.client_secret_file`, and `oidc.ca_file` relative to the config file. The
+`gateway` section configures the `openshell` Helm release; the `dashboard`
+section configures `openshell-dashboard`.
 
 | Field | Description |
 |---|---|
