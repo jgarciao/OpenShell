@@ -236,6 +236,11 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def print_field(label, value):
+    """Print aligned `label: value` lines for command audit output."""
+    print(f"{label + ':':<17} {value}")
+
+
 def fields(obj, required, optional=()):
     require(isinstance(obj, dict), "Configuration sections must be JSON objects")
     require(
@@ -650,16 +655,16 @@ class Installer:
         require(entry, f"kubectl context {name} is not in the kubeconfig")
         cluster = entry.get("context", {}).get("cluster") or ""
         detail = f" (cluster {cluster})" if cluster else ""
-        print(f"kubectl context: {name}{detail}")
+        print_field("kubectl context", f"{name}{detail}")
 
     def audit_identity(self):
         oidc = self.config["oidc"]
         callback = f"https://{self.config['dashboard']['host']}/oauth2/callback"
-        print(
-            f"Target namespace: {self.ns}\n"
-            f"OIDC identity: issuer {oidc['issuer']}, audience {oidc['audience']}, "
-            f"client {oidc['client_id']}, callback {callback}"
-        )
+        print_field("Target namespace", self.ns)
+        print_field("OIDC issuer", oidc["issuer"])
+        print_field("OIDC audience", oidc["audience"])
+        print_field("OIDC client", oidc["client_id"])
+        print_field("OIDC callback", callback)
 
     def run(self, args, payload=None):
         # Never log stdin: it can contain Secret data. Do not echo commands.
@@ -1089,7 +1094,7 @@ class Installer:
     def preflight(self):
         self.warnings = []
         self.passed = 0
-        print(f"Preflight for namespace {self.ns}")
+        print(f"\nPreflight for namespace {self.ns}")
         self.section("Cluster")
         self.run([*self.kube, "get", "--raw", "/apis/route.openshift.io/v1"])
         self.emit("ok", "OpenShift Route API is available")
@@ -1374,6 +1379,7 @@ class Installer:
         # Keep reservations on failure so a conflicting installer cannot proceed.
         self.check_identity(self.get("configmap", INSTALL_STATE))
         self.credentials()
+        self.section("Install")
         for index, release in enumerate(RELEASES):
             print(f"Installing {release} in {self.ns}...", flush=True)
             self.run(
@@ -1412,13 +1418,15 @@ class Installer:
         audience = self.config["oidc"]["audience"]
         endpoint = f"https://{self.config['gateway']['host']}:443"
         context = f' --context "{self.context}"' if self.context else ""
-        print(f"\nDashboard: https://{self.config['dashboard']['host']}")
-        print(f"Gateway:   https://{self.config['gateway']['host']}")
+        print("\nEndpoints")
+        print_field("Dashboard", f"https://{self.config['dashboard']['host']}")
+        print_field("Gateway", f"https://{self.config['gateway']['host']}")
         print("\nNext steps")
         print(
-            "\nIn a shell that is logged in to the cluster (oc login ...), trust the\n"
-            "gateway CA and register the gateway with the OpenShell CLI:\n"
+            "\nRun these in a shell that is logged in to the cluster (oc login ...).\n"
+            "The block is copy-pasteable: every step starts with a shell comment."
         )
+        print("\n# Step 1 of 3: trust the gateway CA in the OpenShell CLI.")
         print("# GW is the local CLI name for this gateway; change it if you prefer.")
         print(f'export NS="{self.ns}"')
         print(f'export GW="{name}"')
@@ -1426,19 +1434,21 @@ class Installer:
         print(f'oc{context} -n "$NS" get secret openshell-client-tls \\')
         print("  -o jsonpath='{.data.ca\\.crt}' | base64 -d \\")
         print('  > "$HOME/.config/openshell/gateways/$GW/mtls/ca.crt"')
-        print("\nopenshell gateway add \\")
+        print("\n# Step 2 of 3: register the gateway and log in through OIDC.")
+        print("# This opens a browser. If the name is already registered, remove it")
+        print('# first with: openshell gateway remove "$GW"')
+        print("openshell gateway add \\")
         print('  --name "$GW" \\')
         print(f'  --oidc-issuer "{issuer}" \\')
         print("  --oidc-client-id openshell-cli \\")
         print(f'  --oidc-audience "{audience}" \\')
         print(f'  "{endpoint}"')
+        print("\n# Step 3 of 3: verify the connection.")
+        print("# Expect Status: Connected and Authentication: Authenticated (OIDC).")
+        print("openshell status")
         print(
-            "\n`openshell gateway add` opens a browser for OIDC login. If the name is\n"
-            'already registered, remove it first with: openshell gateway remove "$GW"'
-        )
-        print(
-            "\nAdministrators must add users to workspaces. Verify login, denied\n"
-            "workspace access, sandbox creation, and terminal execution."
+            "\nAdministrators must add users to workspaces before login is useful.\n"
+            "Verify login, denied workspace access, sandbox creation, and terminals."
         )
 
     def installed_releases(self):
@@ -1554,10 +1564,57 @@ class Installer:
             planned.append(f"ConfigMap {external_ca} (external, will be kept)")
         if state:
             planned.append(f"ConfigMap {INSTALL_STATE}")
-        print(f"Removing from namespace {self.ns}:")
-        for item in planned:
-            print(f"  {item}")
-        print("The namespace itself is kept.")
+
+        removals = []
+        ordered_releases = [
+            release
+            for release in ("openshell-dashboard", "openshell")
+            if release in releases
+        ]
+        if ordered_releases:
+            removals.append(("Helm releases", ordered_releases))
+        tls = [secret for secret in TLS_SECRETS if present.get(("secret", secret))]
+        if tls:
+            removals.append(("TLS Secrets", tls))
+        credentials = []
+        if present.get(("secret", OIDC_SECRET)) and owned_secret:
+            credentials.append(f"Secret {OIDC_SECRET}")
+        if present.get(("configmap", OIDC_CA)) and owned_ca:
+            credentials.append(f"ConfigMap {OIDC_CA}")
+        if credentials:
+            removals.append(("Installer-created credentials", credentials))
+        if state:
+            removals.append(("Installer state", [f"ConfigMap {INSTALL_STATE}"]))
+
+        keeps = []
+        if external_secret and (
+            external_secret == OIDC_SECRET or present.get(("secret", external_secret))
+        ):
+            keeps.append(f"Secret {external_secret} (administrator-managed)")
+        if (
+            present.get(("secret", OIDC_SECRET))
+            and not owned_secret
+            and external_secret != OIDC_SECRET
+        ):
+            keeps.append(f"Secret {OIDC_SECRET} (not installer-owned)")
+        if external_ca and (
+            external_ca == OIDC_CA or present.get(("configmap", external_ca))
+        ):
+            keeps.append(f"ConfigMap {external_ca} (administrator-managed)")
+        if present.get(("configmap", OIDC_CA)) and not owned_ca and not external_ca:
+            keeps.append(f"ConfigMap {OIDC_CA} (not installer-owned)")
+        keeps.append(f"Namespace {self.ns}")
+
+        print(f"\nUninstall from namespace {self.ns}\n")
+        print("Will remove:")
+        for title, items in removals:
+            print(f"  {title}:")
+            for item in items:
+                print(f"    - {item}")
+        print("\nWill keep:")
+        for item in keeps:
+            print(f"  - {item}")
+        print("\nThe namespace and any unrelated resources are left untouched.")
         if not assume_yes:
             require(
                 sys.stdin.isatty(),
@@ -1734,11 +1791,12 @@ class Installer:
             return
         print(f"Retained resources ({reason}):")
         for item in retained:
-            print(f"  {item}")
+            print(f"  - {item}")
 
 
 def render_charts(installer, config, root, chart_dirs):
     charts, files = [], []
+    installer.section("Charts")
     for index, (name, values, local) in enumerate(
         zip(
             ("gateway", "dashboard"),
@@ -1790,10 +1848,7 @@ def render_charts(installer, config, root, chart_dirs):
         )
         charts.append(chart)
         files.append(value_file)
-    print(
-        "Both charts rendered successfully. This does not verify cluster or API compatibility.",
-        flush=True,
-    )
+        installer.emit("ok", f"Rendered {name} chart {config[name]['version']}")
     return charts, files
 
 
@@ -1922,7 +1977,7 @@ def load_config_file(path, namespace=None):
                 "No config.json in this directory; run init first or pass --config"
             )
         raise ValueError(f"Configuration file not found: {path}")
-    print(f"Config file: {resolved}")
+    print_field("Config file", resolved)
     return load_config(resolved, namespace)
 
 
@@ -2171,9 +2226,12 @@ def init_command(args):
             "chart images, not the RHOAI product images. Use --rhoai-version 3.6 "
             "for RHOAI 3.6."
         )
-    print(f"Created {', '.join(targets)} in {directory}")
+    print(f"\nCreated in {directory}:")
+    for name in targets:
+        print(f"  - {name}")
     print(
-        "Next: edit config.json (namespace, hosts, OIDC), then run ./install.py validate."
+        "\nNext: edit config.json (namespace, hosts, OIDC), then run "
+        "./install.py validate."
     )
 
 
@@ -2188,6 +2246,7 @@ def validate_command(args):
             Path(temporary),
             (args.gateway_chart_directory, args.dashboard_chart_directory),
         )
+    print("\nValidation passed. Cluster and API compatibility were not checked.")
 
 
 def preflight_command(args):

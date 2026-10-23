@@ -893,7 +893,62 @@ class InstallTests(unittest.TestCase):
         self.assertIn(f'--oidc-audience "{cluster.config["oidc"]["audience"]}"', text)
         self.assertIn(f'"https://{cluster.config["gateway"]["host"]}:443"', text)
         self.assertIn("openshell gateway remove", text)
+        self.assertIn("# Step 1 of 3", text)
+        self.assertIn("# Step 2 of 3", text)
+        self.assertIn("# Step 3 of 3", text)
+        self.assertIn("openshell status", text)
+        self.assertIn("Status: Connected", text)
         self.assertNotIn("--context", text)
+
+    def test_validate_output_is_grouped(self):
+        path = self.root / "config.json"
+        path.write_text(json.dumps(self.config))
+        for chart in ("gateway", "dashboard"):
+            (self.root / chart).mkdir()
+            (self.root / chart / "Chart.yaml").write_text("version: 0.0.0\n")
+
+        def run(_instance, args, _payload=None):
+            if args[:2] == ["helm", "pull"]:
+                (Path(args[args.index("--destination") + 1]) / "chart.tgz").write_bytes(
+                    b"fake"
+                )
+            return ""
+
+        argv = [
+            "install.py",
+            "validate",
+            "--config",
+            str(path),
+            "--gateway-chart-directory",
+            str(self.root / "gateway"),
+            "--dashboard-chart-directory",
+            str(self.root / "dashboard"),
+        ]
+        with (
+            patch("sys.argv", argv),
+            patch.object(installer.shutil, "which", return_value="helm"),
+            patch.object(installer.Installer, "run", run),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            installer.main()
+        text = output.getvalue()
+        self.assertIn("Charts", text)
+        self.assertIn("[ok] Rendered gateway chart", text)
+        self.assertIn("[ok] Rendered dashboard chart", text)
+        self.assertIn("Validation passed.", text)
+
+    def test_uninstall_inventory_is_grouped(self):
+        cluster = self.installed_cluster()
+        output, error = self.uninstall(cluster)
+        self.assertIsNone(error)
+        self.assertIn("Will remove:", output)
+        self.assertIn("Helm releases:", output)
+        self.assertIn("    - openshell-dashboard", output)
+        self.assertIn("TLS Secrets:", output)
+        self.assertIn("Installer-created credentials:", output)
+        self.assertIn("Installer state:", output)
+        self.assertIn("Will keep:", output)
+        self.assertIn("Namespace openshell-team", output)
 
     def test_next_steps_include_the_selected_context(self):
         cluster = self.cluster()
@@ -1239,7 +1294,9 @@ class InstallTests(unittest.TestCase):
             redirect_stdout(io.StringIO()) as output,
         ):
             installer.main()
-        self.assertIn(f"Config file: {path.resolve()}", output.getvalue())
+        text = output.getvalue()
+        self.assertIn("Config file:", text)
+        self.assertIn(str(path.resolve()), text)
         self.assertEqual(len(commands), 4)
 
     def test_config_reading_cluster_commands_print_the_resolved_path(self):
@@ -1272,7 +1329,8 @@ class InstallTests(unittest.TestCase):
             ):
                 installer.main()
             text = output.getvalue()
-            self.assertIn(f"Config file: {path.resolve()}", text)
+            self.assertIn("Config file:", text)
+            self.assertIn(str(path.resolve()), text)
             self.assertIn(self.config["oidc"]["issuer"], text)
             self.assertIn(self.config["oidc"]["audience"], text)
             self.assertIn(self.config["oidc"]["client_id"], text)
@@ -1513,7 +1571,9 @@ class InstallTests(unittest.TestCase):
             redirect_stdout(io.StringIO()) as output,
         ):
             installer.main()
-        self.assertIn(f"Config file: {path.resolve()}", output.getvalue())
+        text = output.getvalue()
+        self.assertIn("Config file:", text)
+        self.assertIn(str(path.resolve()), text)
 
     def test_uninstall_without_config_or_namespace_errors_naming_both(self):
         empty = self.root / "empty"

@@ -306,9 +306,10 @@ gateway Service URL. It waits for Helm readiness and Route admission. Set
 `--timeout 15m` for a slower cluster.
 
 The command ends with a copy-pasteable next-steps block. It prints the commands
-that copy the gateway CA into the CLI configuration and register the gateway
-with `openshell gateway add`, using this installation's namespace, issuer,
-audience, and Route host. The registration opens the browser OIDC login.
+that copy the gateway CA into the CLI configuration, register the gateway with
+`openshell gateway add` using this installation's namespace, issuer, audience,
+and Route host, and run `openshell status` to confirm the connection. The
+registration opens the browser OIDC login.
 
 For source-chart rendering, use `validate --gateway-chart-directory <path>
 --dashboard-chart-directory <path>`. These flags exist only on `validate`, so an
@@ -517,7 +518,9 @@ server SANs include the gateway public host and namespace-specific Service names
 This OIDC-only mode uses a private gateway CA: export and distribute its `ca.crt`
 from `openshell-client-tls` through a trusted administrator process. Register the
 gateway with the installed CLI's CA options from `openshell gateway add --help`;
-do not disable certificate verification. TLS client-certificate authentication
+do not disable certificate verification. After the browser login, run
+`openshell status` and confirm `Status: Connected` and
+`Authentication: Authenticated (OIDC)`. TLS client-certificate authentication
 is disabled; supervisors retain gateway-minted sandbox JWT authentication.
 
 The dashboard uses an edge Route and trusts the gateway CA for internal calls.

@@ -631,6 +631,15 @@ This opens a browser for the Authorization Code + PKCE login. `--oidc-client-id`
 defaults to `openshell-cli`, so you may omit it. The port is `443` (the
 passthrough Route), which forwards to the gateway's gRPC port.
 
+Verify the registration and login:
+
+```shell
+openshell status
+```
+
+Expect `Status: Connected` and `Authentication: Authenticated (OIDC)`, with the
+gateway endpoint you registered above.
+
 ### 4.3 Add an inference provider and select a model
 
 Example using Claude on Google Vertex AI with Application Default Credentials:
