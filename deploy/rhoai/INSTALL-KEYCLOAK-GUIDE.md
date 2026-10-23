@@ -262,7 +262,7 @@ Under **Credentials** tab:
 
 Sections 2.4 and 2.5 create the two clients in the admin console. If you prefer,
 create them both through the Keycloak admin REST API instead. This produces the
-same result and writes the dashboard client secret to the file Part 3.2 expects,
+same result and writes the dashboard OIDC client secret to the file Part 3.2 expects,
 so you can skip 2.4, 2.5, and Part 3.2. You still need the realm (2.1), roles
 (2.2), and users (2.3).
 
@@ -311,14 +311,14 @@ if [ "$(curl -sk -H "$H" "$API/$ID/protocol-mappers/models" \
   }"
 fi
 
-# Save the dashboard client secret where Part 3.2 expects it. Run this from
+# Save the dashboard OIDC client secret where Part 3.2 expects it. Run this from
 # the installer working directory created in Part 3.1 (or move the file there
 # before installing).
 curl -sk -H "$H" "$API/$ID/client-secret" \
   | python3 -c "import sys,json;sys.stdout.write(json.load(sys.stdin)['value'])" \
-  > dashboard-client-secret.txt
-chmod 600 dashboard-client-secret.txt
-echo "Clients ready; dashboard secret written to dashboard-client-secret.txt"
+  > openshell-dashboard-oidc-secret.txt
+chmod 600 openshell-dashboard-oidc-secret.txt
+echo "Clients ready; dashboard OIDC client secret written to openshell-dashboard-oidc-secret.txt"
 ```
 
 > **Already ran the installer before creating the client?** The installer copies
@@ -329,7 +329,7 @@ echo "Clients ready; dashboard secret written to dashboard-client-secret.txt"
 > ```shell
 > COOKIE=$(oc -n "$NS" get secret openshell-dashboard-oidc -o jsonpath='{.data.cookie-secret}' | base64 -d)
 > oc -n "$NS" create secret generic openshell-dashboard-oidc \
->   --from-literal=client-secret="$(cat dashboard-client-secret.txt)" \
+>   --from-literal=client-secret="$(cat openshell-dashboard-oidc-secret.txt)" \
 >   --from-literal=cookie-secret="$COOKIE" \
 >   --dry-run=client -o yaml | oc apply -f -
 > oc -n "$NS" rollout restart deployment openshell-dashboard
@@ -432,13 +432,14 @@ it never infers a provider preset:
 Keep `admin_role` and `user_role` at your realm's role names. `allowed_groups`
 is still valid with `keycloak-oidc`; the two filters are independent.
 
-### 3.2 Save the client secret
+### 3.2 Save the dashboard OIDC client secret
 
-Write the dashboard client secret from 2.5 into the same directory:
+Write the dashboard OIDC client secret (the browser client's secret) from 2.5
+into the same directory:
 
 ```shell
-echo -n "PASTE_CLIENT_SECRET_HERE" > dashboard-client-secret.txt
-chmod 600 dashboard-client-secret.txt
+echo -n "PASTE_CLIENT_SECRET_HERE" > openshell-dashboard-oidc-secret.txt
+chmod 600 openshell-dashboard-oidc-secret.txt
 ```
 
 Alternatively, delete that file reference and pass
@@ -502,7 +503,7 @@ Secret containing `client-secret` and `cookie-secret`.
     "provider": "keycloak-oidc",
     "issuer": "https://keycloak.<apps-domain>/realms/openshell",
     "client_id": "openshell-dashboard-openshell-team",
-    "client_secret_file": "dashboard-client-secret.txt",
+    "client_secret_file": "openshell-dashboard-oidc-secret.txt",
     "audience": "openshell-api-openshell-team",
     "roles_claim": "realm_access.roles",
     "admin_role": "openshell-admin",

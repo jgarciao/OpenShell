@@ -148,7 +148,7 @@ CONFIG_TEMPLATE = """\
     "provider": "oidc",
     "issuer": "https://identity.example.com/realms/customer",
     "client_id": "openshell-dashboard-openshell-team",
-    "client_secret_file": "dashboard-client-secret.txt",
+    "client_secret_file": "openshell-dashboard-oidc-secret.txt",
     "audience": "openshell-api-openshell-team",
     "roles_claim": "roles",
     "admin_role": "openshell-admin",

@@ -1603,7 +1603,7 @@ class InstallTests(unittest.TestCase):
         )
         config["gateway"]["version"] = "0.1.3"
         config["dashboard"]["version"] = "0.1.0"
-        (work / "dashboard-client-secret.txt").write_text("secret\n")
+        (work / "openshell-dashboard-oidc-secret.txt").write_text("secret\n")
         path = work / "config.json"
         path.write_text(json.dumps(config))
         loaded = installer.load_config(path)
@@ -1675,7 +1675,7 @@ class InstallTests(unittest.TestCase):
             installer.AUTH_PROXY_IMAGE,
         )
         self.assertIn("rhoai-3.6", json.dumps(config["gateway"]["images"]))
-        (work / "dashboard-client-secret.txt").write_text("secret\n")
+        (work / "openshell-dashboard-oidc-secret.txt").write_text("secret\n")
         installer.load_config(work / "config.json")
 
     def test_init_cluster_app_domain_derives_hosts_and_keeps_placeholders(self):

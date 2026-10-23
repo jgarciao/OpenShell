@@ -58,7 +58,7 @@ existing process. The installer creates none of them.
 | OAuth scopes | `oidc.scope` | shared |
 | API audience | `oidc.audience` | deployment |
 | Browser client ID | `oidc.client_id` | deployment |
-| Client secret file or existing Secret | `oidc.client_secret_file` / `oidc.client_secret_secret` | deployment |
+| Dashboard OIDC client secret file or existing Secret | `oidc.client_secret_file` / `oidc.client_secret_secret` | deployment |
 | Access assignments | `oidc.allowed_groups` / `oidc.allowed_roles` | deployment |
 | Dashboard callback URL | derived: `https://<dashboard.host>/oauth2/callback` | deployment |
 
@@ -94,11 +94,14 @@ provider puts in tokens and the base URL for its
 provider and is not the cluster's apps domain or the dashboard URL. Use the
 value verbatim, without a trailing slash.
 
-Write the browser client secret beside the config, then run the remaining steps:
+Write the dashboard OIDC client secret beside the config, then run the remaining
+steps. This is the secret of the dashboard's browser client (`oidc.client_id`);
+the file name mirrors the in-cluster Secret it becomes,
+`openshell-dashboard-oidc`:
 
 ```shell
-printf '%s\n' '<client secret>' > dashboard-client-secret.txt
-chmod 600 dashboard-client-secret.txt
+printf '%s\n' '<dashboard OIDC client secret>' > openshell-dashboard-oidc-secret.txt
+chmod 600 openshell-dashboard-oidc-secret.txt
 
 ./install.py validate
 ./install.py preflight
@@ -189,8 +192,8 @@ Each `config.json` is self-contained. `load_config` resolves `helm_overrides`,
 | `helm_overrides` | Operational YAML values files, merged in order |
 | `gateway.host`, `dashboard.host` | Public Route hosts; must differ |
 | `oidc.provider` | `oidc` or `keycloak-oidc`, passed to oauth2-proxy |
-| `oidc.client_secret_file` | Browser client secret file; mutually exclusive with `client_secret_secret` |
-| `oidc.client_secret_secret` | Existing Secret with `client-secret` and `cookie-secret` |
+| `oidc.client_secret_file` | Dashboard OIDC client secret file (the browser client's secret); mutually exclusive with `client_secret_secret` |
+| `oidc.client_secret_secret` | Existing administrator-managed Secret with `client-secret` and `cookie-secret`; never owned |
 | `oidc.ca_file` | PEM CA bundle; the installer creates and owns `openshell-oidc-ca` |
 | `oidc.ca_configmap` | Existing CA ConfigMap; never owned; mutually exclusive with `ca_file` |
 | `oidc.allowed_groups` | Dashboard login filter for either provider |
@@ -276,7 +279,8 @@ A bare invocation is a usage error, never an install.
 `validate` is offline. It validates the config, merges override files, and
 renders both charts with `helm pull` and `helm template`. It downloads the
 pinned charts but does not check connectivity, SCC admission, token claims, or
-runtime behavior. It reads the client secret file's existence and size, not its
+runtime behavior. It reads the dashboard OIDC client secret file's existence and
+size, not its
 contents, and performs no RHOAI CSV lookup.
 
 `preflight` renders both charts and then checks the cluster without mutating it:
