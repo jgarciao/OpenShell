@@ -1402,13 +1402,43 @@ class Installer:
                     "Gateway did not create its CA Secret",
                 )
             self.wait_for_route(release)
-        print(f"Dashboard: https://{self.config['dashboard']['host']}")
-        print(f"Gateway: https://{self.config['gateway']['host']}")
+        self.print_next_steps()
+
+    def print_next_steps(self):
+        # Print copy-pasteable onboarding commands with this installation's
+        # resolved values. No secret is printed: the CA is copied, not echoed.
+        name = f"openshell-{self.ns}"
+        issuer = self.config["oidc"]["issuer"]
+        audience = self.config["oidc"]["audience"]
+        endpoint = f"https://{self.config['gateway']['host']}:443"
+        context = f' --context "{self.context}"' if self.context else ""
+        print(f"\nDashboard: https://{self.config['dashboard']['host']}")
+        print(f"Gateway:   https://{self.config['gateway']['host']}")
+        print("\nNext steps")
         print(
-            "Register the gateway with the CLI using its CA, then log in through customer OIDC."
+            "\nIn a shell that is logged in to the cluster (oc login ...), trust the\n"
+            "gateway CA and register the gateway with the OpenShell CLI:\n"
+        )
+        print("# GW is the local CLI name for this gateway; change it if you prefer.")
+        print(f'export NS="{self.ns}"')
+        print(f'export GW="{name}"')
+        print('mkdir -p "$HOME/.config/openshell/gateways/$GW/mtls"')
+        print(f'oc{context} -n "$NS" get secret openshell-client-tls \\')
+        print("  -o jsonpath='{.data.ca\\.crt}' | base64 -d \\")
+        print('  > "$HOME/.config/openshell/gateways/$GW/mtls/ca.crt"')
+        print("\nopenshell gateway add \\")
+        print('  --name "$GW" \\')
+        print(f'  --oidc-issuer "{issuer}" \\')
+        print("  --oidc-client-id openshell-cli \\")
+        print(f'  --oidc-audience "{audience}" \\')
+        print(f'  "{endpoint}"')
+        print(
+            "\n`openshell gateway add` opens a browser for OIDC login. If the name is\n"
+            'already registered, remove it first with: openshell gateway remove "$GW"'
         )
         print(
-            "An administrator must add users to workspaces. Verify login, denied access, sandbox creation and terminals."
+            "\nAdministrators must add users to workspaces. Verify login, denied\n"
+            "workspace access, sandbox creation, and terminal execution."
         )
 
     def installed_releases(self):

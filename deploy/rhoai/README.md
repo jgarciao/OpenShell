@@ -305,6 +305,11 @@ checks its CA Secret, and installs the dashboard with that CA and the internal
 gateway Service URL. It waits for Helm readiness and Route admission. Set
 `--timeout 15m` for a slower cluster.
 
+The command ends with a copy-pasteable next-steps block. It prints the commands
+that copy the gateway CA into the CLI configuration and register the gateway
+with `openshell gateway add`, using this installation's namespace, issuer,
+audience, and Route host. The registration opens the browser OIDC login.
+
 For source-chart rendering, use `validate --gateway-chart-directory <path>
 --dashboard-chart-directory <path>`. These flags exist only on `validate`, so an
 offline render cannot touch a cluster. Source charts carry version `0.0.0`, so

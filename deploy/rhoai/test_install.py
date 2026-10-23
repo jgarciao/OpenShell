@@ -880,6 +880,28 @@ class InstallTests(unittest.TestCase):
         cookie = base64.b64decode(data["cookie-secret"]).decode()
         self.assertEqual(len(base64.urlsafe_b64decode(cookie + "=")), 32)
 
+    def test_install_prints_copy_paste_next_steps(self):
+        cluster = self.cluster()
+        with redirect_stdout(io.StringIO()) as output:
+            cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        text = output.getvalue()
+        self.assertIn('export NS="openshell-team"', text)
+        self.assertIn('export GW="openshell-openshell-team"', text)
+        self.assertIn('oc -n "$NS" get secret openshell-client-tls', text)
+        self.assertIn("openshell gateway add", text)
+        self.assertIn(f'--oidc-issuer "{cluster.config["oidc"]["issuer"]}"', text)
+        self.assertIn(f'--oidc-audience "{cluster.config["oidc"]["audience"]}"', text)
+        self.assertIn(f'"https://{cluster.config["gateway"]["host"]}:443"', text)
+        self.assertIn("openshell gateway remove", text)
+        self.assertNotIn("--context", text)
+
+    def test_next_steps_include_the_selected_context(self):
+        cluster = self.cluster()
+        cluster.context = "ctx"
+        with redirect_stdout(io.StringIO()) as output:
+            cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        self.assertIn('oc --context "ctx" -n "$NS"', output.getvalue())
+
     def test_rerun_preserves_secrets_without_input_file(self):
         cluster = self.cluster()
         cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
