@@ -1,207 +1,253 @@
-# OpenShell and Dashboard installer for OpenShift
+# OpenShell and dashboard installer for OpenShift
 
-This ODH-fork installer installs two independent Helm releases, `openshell` and
-`openshell-dashboard`, into the administrator-selected namespace. It reuses an
-existing namespace or creates it if missing. Each namespace has one gateway and
-its dashboard; reruns upgrade the same releases. The gateway chart supplies
-the gateway and the configuration for launching supervisor and sandbox workloads.
-The UI chart remains in the [dashboard repository](https://github.com/opendatahub-io/openshell-dashboard/tree/main/deploy/helm/openshell-dashboard).
+This ODH-fork installer installs OpenShell and the OpenShell dashboard as two
+Helm releases on OpenShift. It is a lifecycle CLI driven from a local working
+directory:
 
-This is an initial installer, not a qualified RHOAI deployment. Gateway chart
-`0.1.3` and dashboard chart `0.1.0`, using their default images, passed the live
-smoke checks below on OpenShift `4.21.8`. Matching `0.1` release lines alone do
-not prove API compatibility. Choose exact published versions and validate them
-together. The script intentionally has no default release versions. Exact SemVer
-prereleases such as `0.0.0-dev.<commit>` are accepted for downstream builds;
-accepting a version does not establish chart or image compatibility.
+| Subcommand | Cluster access | Purpose |
+|---|---|---|
+| `init` | No | Scaffold `config.json` and both override files |
+| `validate` | No | Validate config and render both charts |
+| `preflight` | Read-only | Check cluster prerequisites and conflicts |
+| `install` | Yes | Install or upgrade the gateway and dashboard |
+| `uninstall` | Yes | Remove the releases and installer-owned resources |
 
-## Live validation
+The installer installs both components together, always. A gateway-only
+deployment is a plain `helm install` of the gateway chart, documented in
+[Gateway-only install](#gateway-only-install-advanced) and in
+[INSTALL-KEYCLOAK-GUIDE.md](INSTALL-KEYCLOAK-GUIDE.md).
 
-On October 13, 2026, the installer was exercised on an OpenShift `4.21.8` cluster
-with RHOAI installed, OVN Kubernetes, `gp3-csi` storage, Agent Sandbox `v1.0.6`, and
-an existing Red Hat build of Keycloak `26.4.10`. A dedicated test realm supplied
-OIDC; existing customer realms were not changed.
-
-The following checks passed with gateway chart `0.1.3` and dashboard chart `0.1.0`:
-
-- First installation into a new namespace and a second run with the same inputs.
-- Installation and rerun in a separately pre-created namespace selected with
-  `--namespace`, with both releases reaching revision 2 and the namespace's labels,
-  annotations, and OpenShift SCC allocations preserved.
-- Gateway readiness, both dashboard containers ready, and persistent storage bound.
-- Public HTTPS routing and HTTP 401 for unauthenticated dashboard API requests.
-- Browser OIDC redirect/login/callback flow and authenticated workspace and gateway API calls.
-- Manual browser confirmation of the workspaces page, platform-admin identity,
-  healthy gateway indicator, and active default workspace.
-- Dashboard compatibility response reporting the gateway release line as supported.
-- Sandbox creation through the dashboard API, workload/supervisor readiness,
-  authenticated terminal WebSocket execution with exit code 0, and completed deletion.
-- Upgrade using YAML resource overrides and explicit OIDC scopes, with legacy
-  installer state migrated to record the gateway identity.
-- Read-only authorization verification: admin access to both test workspaces,
-  ordinary-user access to its assigned workspace and HTTP 403 for the other.
-  A separate live check confirmed access was denied after membership revocation.
-  Browser login and sandbox/terminal smoke checks also passed after the upgrade.
-
-These checks do not establish FIPS qualification, production certificate renewal,
-isolation beyond the exercised workspace checks, or a full UI interaction test. The live
-configuration and credentials are kept outside the repository.
+The installer consumes administrator-provided authentication configuration. It
+never creates realms, clients, audiences, role mappings, or users in an identity
+provider and never handles identity-provider administration credentials.
 
 ## Prerequisites
 
-- `uv`, Helm 3.17.3 or later, and `kubectl` on the administrator's workstation.
-- An OpenShift cluster, an explicit kubeconfig context, and permission to manage
-  the namespaced/cluster resources required by the charts. Permission to create
-  namespaces is needed only when the selected namespace does not exist. Preflight
-  also reads StorageClasses, nodes, ClusterVersion, and installer-labeled ConfigMaps
-  across namespaces. System namespaces such as `default`, `kube-*`, and
-  `openshift-*` are rejected.
+- `uv`, which fetches Python 3.11 or later and PyYAML automatically. No separate
+  Python install is needed.
+- Helm 3.17.3 or later and `kubectl` on the administrator's workstation.
+- An OpenShift cluster and an authenticated session (`oc login ...`). `init` and
+  `validate` need neither a cluster nor `kubectl`.
 - Agent Sandbox CRDs and a running controller installed by the cluster
-  administrator. The installer checks the supported served Sandbox API and waits
-  for the controller Deployment. Override `agent_sandbox_namespace` and
-  `agent_sandbox_deployment` in the JSON if your installation uses different names.
-- A CNI enforcing NetworkPolicy, a working default StorageClass, and cluster SCC
-  configuration appropriate for the pinned gateway's sandbox runtime.
-- Customer-managed HTTPS OIDC, a confidential browser client with PKCE S256,
-  and access tokens whose audience and role claims match the gateway settings.
-- Distinct dashboard and gateway DNS names pointing at the OpenShift router.
-  The dashboard name must be covered by the router's default certificate.
-- Registry access from the workstation for chart pulls and from cluster nodes
-  for all images. Private image pull-secret provisioning is outside this first
-  installer; use cluster-managed registry credentials if needed.
+  administrator. Override `agent_sandbox_namespace` and
+  `agent_sandbox_deployment` if your installation uses different names.
+- A CNI enforcing NetworkPolicy and a default block-backed StorageClass for the
+  gateway's SQLite PVC.
+- Access to `registry.redhat.io` from the cluster nodes for the RHOAI product
+  images, with a pull secret in both override files and on the gateway
+  (`server.sandboxImagePullSecrets`). The hardened `authProxy` image lives on
+  the public `registry.access.redhat.com` and needs no pull secret.
+- Permission to manage the namespaced and cluster-scoped resources the charts
+  require. Preflight checks the actual operations instead of requiring wildcard
+  cluster-admin.
 
 The installer does not install an IdP, Agent Sandbox, RHOAI, a modular operator,
-or console integration. Administrators retain responsibility for these cluster
-prerequisites. It does not change your current kubeconfig context.
+or console integration. It does not change your current kubeconfig context.
 
-## Configure and install
+## Inputs the installer consumes
 
-Copy the configuration outside the checkout so local credentials cannot be
-accidentally committed:
+An identity-provider administrator supplies these through the organization's
+existing process. The installer creates none of them.
 
-```shell
-mkdir -p "$HOME/.config/openshell-rhoai"
-chmod 700 "$HOME/.config/openshell-rhoai"
-cp deploy/rhoai/config.example.json "$HOME/.config/openshell-rhoai/config.json"
-```
+| Input | Config field | Scope |
+|---|---|---|
+| Provider type (`oidc` or `keycloak-oidc`) | `oidc.provider` | shared |
+| Issuer URL | `oidc.issuer` | shared |
+| CA bundle or existing ConfigMap | `oidc.ca_file` / `oidc.ca_configmap` | shared |
+| Claim and role names | `oidc.roles_claim`, `admin_role`, `user_role` | shared |
+| OAuth scopes | `oidc.scope` | shared |
+| API audience | `oidc.audience` | deployment |
+| Browser client ID | `oidc.client_id` | deployment |
+| Client secret file or existing Secret | `oidc.client_secret_file` / `oidc.client_secret_secret` | deployment |
+| Access assignments | `oidc.allowed_groups` / `oidc.allowed_roles` | deployment |
+| Dashboard callback URL | derived: `https://<dashboard.host>/oauth2/callback` | deployment |
 
-Edit the copy. Replace both version placeholders with exact published SemVer
-chart versions, and set the namespace, kubeconfig context, DNS names, and OIDC
-claims. The two versions need not have the same patch number. The dashboard OCI
-reference currently points to its upstream publisher, not an ODH chart registry.
-Both chart references are configurable for mirrors.
+The Keycloak guide is a companion for administrators who still need to create
+those provider registrations. It is not required reading for other providers.
 
-For ODH images, select the development chart matching the upstream commit of
-the downstream build, then set `gateway.images` to the downstream registry,
-repositories, and image tags/digests. The installer does not infer that mapping
-or silently select a newer chart. Source version `0.0.0`, floating tags, and
-version ranges are rejected for installation.
+## Quick start
 
-Save the browser client's secret to `dashboard-client-secret.txt` beside the JSON,
-using a trusted editor or your secret manager. Restrict its permissions to `0600`.
-Do not put the secret in the JSON, Helm values, or command arguments. File paths
-in `oidc.client_secret_file` and optional `oidc.ca_file` are relative to the JSON.
-The latter supplies a PEM CA bundle for a private OIDC issuer to both releases.
-
-Register `https://<dashboard host>/oauth2/callback` with your IdP. The browser
-client ID is separate from the gateway API audience. Generic OIDC uses
-`allowed_groups`; Keycloak can use `provider: "keycloak-oidc"` and `allowed_roles`.
-These are alternatives, not assumptions about customer claim names.
-
-`allowed_roles` filters dashboard login independently of gateway authorization.
-To admit both admin-only and ordinary users, include both roles: for realm roles,
-use `"allowed_roles": ["openshell-admin", "openshell-user"]`. For client roles,
-prefix each role with the Keycloak client ID that defines it, for example
-`"allowed_roles": ["openshell-api-openshell-team:openshell-admin", "openshell-api-openshell-team:openshell-user"]`.
-Replace these example names with your IdP's role and client names. Users need
-at least one listed role, not both; listing only `openshell-user` excludes users
-who have only `openshell-admin`. Without either UI filter, any authenticated IdP
-user can reach the UI, but the gateway still enforces its roles and workspace access.
-
-Optional `oidc.scope` supplies space-separated OAuth scopes including `openid`
-(for example `openid email profile offline_access`). Request only scopes your
-IdP supports; include `groups` if your provider requires it for group claims.
-When omitted, oauth2-proxy keeps its provider defaults.
-
-Validate both charts without connecting to the cluster:
+Download the script once into a dedicated working directory, pinned to a tag or
+commit SHA, never `main`:
 
 ```shell
-uv run --script --python 3.12 deploy/rhoai/install.py \
-  --config "$HOME/.config/openshell-rhoai/config.json" --check
+mkdir openshell-on-rhoai && cd openshell-on-rhoai
+curl -LsSfO https://raw.githubusercontent.com/opendatahub-io/openshell/<tag-or-sha>/deploy/rhoai/install.py
+chmod +x install.py
 ```
 
-Install:
+For RHOAI 3.6, initialize with one command:
 
 ```shell
-uv run --script --python 3.12 deploy/rhoai/install.py \
-  --config "$HOME/.config/openshell-rhoai/config.json"
+APPS_DOMAIN="$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')"
+./install.py init \
+  --namespace openshell-team \
+  --cluster-app-domain "$APPS_DOMAIN" \
+  --rhoai-version 3.6 \
+  --oidc-issuer https://identity.example.com/realms/customer
 ```
 
-Set `namespace` in the JSON to your team/project namespace, or override it on the
-command line (the override also works with `--check`):
+`--oidc-issuer` is the OIDC issuer URL: the exact `iss` claim the identity
+provider puts in tokens and the base URL for its
+`/.well-known/openid-configuration` discovery document. For Keycloak it is
+`https://<host>/realms/<realm>`. It is shared by every installation behind that
+provider and is not the cluster's apps domain or the dashboard URL. Use the
+value verbatim, without a trailing slash.
+
+Write the browser client secret beside the config, then run the remaining steps:
 
 ```shell
-uv run --script --python 3.12 deploy/rhoai/install.py \
-  --config "$HOME/.config/openshell-rhoai/config.json" --namespace research-team
+printf '%s\n' '<client secret>' > dashboard-client-secret.txt
+chmod 600 dashboard-client-secret.txt
+
+./install.py validate
+./install.py preflight
+./install.py install
 ```
 
-`--namespace` takes precedence; you may omit the JSON `namespace` when passing
-this option. Both charts, Secrets, and sandbox resources target this namespace.
-Gateway Service DNS and certificate SANs are derived from the selected name.
-Existing namespace labels, annotations, and OpenShift SCC allocations are
-preserved. Use a separate configuration with distinct public hostnames for each
-gateway namespace, and register each dashboard callback with the IdP. Specifying
-a different namespace creates another deployment; it does not move an existing one.
+`init` scaffolds three files in the current directory:
 
-Provision a distinct API audience and browser client per gateway, even when
-gateways share an issuer. The example uses `openshell-api-openshell-team` and
-`openshell-dashboard-openshell-team`; change these registrations and the JSON
-when selecting another namespace. `--namespace` does not rewrite OIDC identifiers
-or create IdP clients. Configure per-gateway role/group mappings at your IdP;
-a namespace alone is not an authentication boundary.
+- `config.json`, which wires in both override files through `helm_overrides`.
+- `gateway-overrides.yaml` and `dashboard-overrides.yaml`, which hold operational
+  Helm values.
 
-Preflight rejects an issuer/audience or issuer/browser-client pair already
-recorded by another installer-managed namespace. It cannot discover registrations
-outside this installer, tokens with multiple audiences, or old installation
-state that has no identity metadata. Verify those cases with your IdP admin.
-Installation repeats the conflict check after recording its identity reservation
-and before running Helm. Overlapping installs can both stop with reservations
-preserved; inspect both namespaces and resolve the identity conflict explicitly
-before retrying.
+To use an administrator-managed Secret instead of a local file, pass
+`--oidc-client-secret-secret <name>` to `init`. The Secret must contain
+`client-secret` and `cookie-secret`; the installer never creates, labels, or
+modifies it.
 
-`--check` still downloads the pinned charts. It discards rendered manifests and
-does not validate connectivity, SCC admission, token claims, or runtime behavior.
-It reads the client secret file's existence/size, not its contents. Temporary
-values files have owner-only permissions and contain no client or cookie secrets.
+### RHOAI compatibility
 
-Run cluster preflight without installing:
+`--rhoai-version` pins the tested chart pair and the product images in one step.
+A profile is supported only when both charts and every image resolve at the
+recorded versions.
 
-```shell
-uv run --script --python 3.12 deploy/rhoai/install.py \
-  --config "$HOME/.config/openshell-rhoai/config.json" --preflight
+| Profile | Gateway chart | Dashboard chart | Image tag | Pre-release | Images qualified |
+|---|---|---|---|---|---|
+| `3.6.0` (alias `3.6`) | `0.1.3` | `0.1.0` | `rhoai-3.6` | no | no |
+
+The `3.6.0` image combination has not yet passed the live smoke run against the
+frozen 3.6 build, so `init` warns that it is unqualified. Add pre-release and GA
+builds of a new line as separate rows with their own chart pins; a bare `X.Y`
+resolves only to the GA row and never to an EA. The profile table, this table,
+and the exact-command block change together at release time.
+
+The profile writes `registry.redhat.io/rhoai/odh-openshell-*-rhel9` images:
+
+- `gateway`, `supervisor`, and `sandboxRuntime` from
+  `odh-openshell-{gateway,supervisor,sandbox}-rhel9`.
+- `sandbox` with the full repository path in `gateway.images.sandbox`, because
+  the chart's sandbox image has no registry key.
+- `dashboard` from `odh-openshell-dashboard-rhel9`.
+- `authProxy` from the hardened public image
+  `registry.access.redhat.com/hi/oauth2-proxy:7.15.4`. No RHOAI build ships an
+  oauth2-proxy image. The chart default is `v7.15.2`; `7.15.4` is a patch bump.
+  For mirrored or disconnected installs, set a reviewed mirror.
+
+Without `--rhoai-version` there is no `images` block and the charts' upstream
+defaults apply. `init` prints a notice in that case. The explicit
+`--openshell-version` and `--openshell-dashboard-version` flags are the advanced,
+profile-free path; they are mutually exclusive with `--rhoai-version`.
+
+The chart artifacts themselves remain upstream OCI references; only the images
+and the tested chart versions are RHOAI-specific. Set the `registry.redhat.io`
+pull secret in both override files and on the gateway:
+
+```yaml
+# gateway-overrides.yaml
+imagePullSecrets:
+  - name: redhat-registry
+server:
+  sandboxImagePullSecrets:
+    - name: redhat-registry
 ```
 
-This renders both charts, checks the default and selected workspace storage
-classes, checks create/patch permissions for installation resources and
-update/delete permissions for Helm release Secrets (including history pruning),
-verifies Agent Sandbox readiness, and detects release/identity conflicts. It reports the
-OpenShift version and node kernels and flags older kernels for runtime validation.
-It does not encode a Red Hat product support matrix or prove storage health,
-RBAC bind/escalate permissions, quota, SCC admission, or application compatibility.
-Preflight reads supplied credential files to check for unintended rotation;
-`--check` does not read their contents. `uv` installs the pinned PyYAML dependency
-for parsing values files.
+```yaml
+# dashboard-overrides.yaml
+imagePullSecrets:
+  - name: redhat-registry
+```
+
+The profile pins the `rhoai-3.6` line tag, never a digest. RHOAI rebuilds images
+through code freeze and republishes them per z-stream, so digests are recorded in
+the validation evidence with the operator CSV version, not in the installer. Pin
+a digest per installation with `images.*.digest` when immutability is required.
+`preflight` compares the configured images with the cluster's `rhods-operator`
+CSV and fails on a repository or digest mismatch. When RHOAI is absent or a tag
+cannot be resolved, it warns and continues.
+
+## Configuration
+
+Each `config.json` is self-contained. `load_config` resolves `helm_overrides`,
+`oidc.client_secret_file`, and `oidc.ca_file` relative to the config file.
+
+| Field | Description |
+|---|---|
+| `namespace` | Target application namespace; system namespaces are rejected |
+| `gateway.version` | Exact gateway chart version, not the image tag |
+| `dashboard.version` | Exact dashboard chart version, not the image tag |
+| `helm_overrides` | Operational YAML values files, merged in order |
+| `gateway.host`, `dashboard.host` | Public Route hosts; must differ |
+| `oidc.provider` | `oidc` or `keycloak-oidc`, passed to oauth2-proxy |
+| `oidc.client_secret_file` | Browser client secret file; mutually exclusive with `client_secret_secret` |
+| `oidc.client_secret_secret` | Existing Secret with `client-secret` and `cookie-secret` |
+| `oidc.ca_file` | PEM CA bundle; the installer creates and owns `openshell-oidc-ca` |
+| `oidc.ca_configmap` | Existing CA ConfigMap; never owned; mutually exclusive with `ca_file` |
+| `oidc.allowed_groups` | Dashboard login filter for either provider |
+| `oidc.allowed_roles` | Dashboard login filter, valid only with `keycloak-oidc` |
+| `rhods_operator_namespace` | Where preflight looks for the RHOAI CSV (default `redhat-ods-operator`) |
+
+There is no `context` field. The installer uses the current kubectl context;
+pass `--context` to override it. Every cluster-touching command prints the
+resolved context and cluster, and the identity it will use, before its first
+cluster call. `preflight`, `install`, and `uninstall` refuse to run when
+`current-context` is empty.
+
+`init` derives deployment identity from the namespace unless you override it:
+
+- `client_id` becomes `openshell-dashboard-<namespace>`.
+- `audience` becomes `openshell-api-<namespace>`.
+- `--cluster-app-domain <domain>` derives `gateway-<namespace>.<domain>` and
+  `dashboard-<namespace>.<domain>`.
+
+Derived hosts are always namespace-qualified, so two installations cannot claim
+the same host, and the router's default `*.apps.<domain>` certificate covers
+them. Use `--gateway-host` and `--dashboard-host` when organizational naming
+differs or a long namespace would push a derived label past the 63-character DNS
+limit. `validate`, `preflight`, and `install` accept `--namespace`, which changes
+the target namespace but never the identity values; the printed identity line
+makes a mismatch visible.
+
+`init` is non-interactive and writes only into the current directory. It
+refuses to overwrite any of the three files.
+
+### Access filters
+
+`allowed_groups` is valid for either provider. `allowed_roles` requires
+`provider: "keycloak-oidc"` and matches the claim named by `roles_claim` (for
+Keycloak, realm roles arrive under `realm_access.roles`). The two lists are
+independent: selecting `keycloak-oidc` does not remove group configuration, and
+both may be present. `allowed_roles` gates dashboard login only; gateway
+authorization still uses `admin_role` and `user_role`.
+
+List every role that may sign in. Listing only `openshell-user` locks out
+users who have only `openshell-admin`. Keycloak client roles are written
+`<client-id>:<role>`. Claim names, role names, filters, and scope are
+administrator-supplied values; `init` writes neutral defaults and never infers a
+provider layout.
+
+Optional `oidc.scope` supplies space-separated OAuth scopes including `openid`.
+Request only scopes your IdP supports; include `groups` if your provider
+requires it for group claims.
 
 ## Chart values
 
-Set `gateway.values_files` and/or `dashboard.values_files` to lists of YAML or JSON
-files, relative to the configuration file. Files merge in order: maps merge,
-later scalars and lists replace earlier ones. Keep the same files for reruns;
-the installer passes the merged result on every upgrade. Start with
-[gateway-values.example.yaml](gateway-values.example.yaml) and
-[dashboard-values.example.yaml](dashboard-values.example.yaml).
-
-Supported operational overrides are:
+Set `gateway.helm_overrides` and/or `dashboard.helm_overrides` to lists of YAML
+or JSON files relative to the config. Files merge in order: maps merge, later
+scalars and lists replace earlier ones. Keep the same files for reruns; the
+installer passes the merged result on every upgrade. Start with
+[gateway-overrides.example.yaml](gateway-overrides.example.yaml) and
+[dashboard-overrides.example.yaml](dashboard-overrides.example.yaml).
 
 | Chart | Values |
 |---|---|
@@ -209,152 +255,324 @@ Supported operational overrides are:
 | Gateway | `server.workspaceStorageClass`, `server.workspaceDefaultStorageSize`, `server.defaultRuntimeClassName`, `server.sandboxImagePullSecrets` |
 | Dashboard | `authProxy.resources`, `authProxy.cookie.refresh`, `authProxy.upstreamTimeout`, `networkPolicy.ingressNamespace`, `networkPolicy.ingressFrom` |
 
-For example, add `"values_files": ["gateway-values.yaml"]` to the `gateway`
-section. Reference existing image-pull Secrets by name; do not put credentials
-in values files. Authentication, TLS, release names, service ports, and namespace
-wiring remain owned by the installer. Unsupported overrides fail before cluster
-access. Extending this set requires checking the pinned charts' contracts.
-The gateway chart's SQLite PVC still requires a default block-backed StorageClass;
-`workspaceStorageClass` affects sandbox workspace PVCs only.
+Reference existing image-pull Secrets by name; do not put credentials in values
+files. Authentication, TLS, release names, service ports, and namespace wiring
+remain owned by the installer. Unsupported overrides fail before cluster access.
 
-The installer creates the namespace only when missing, then creates an installer
-state ConfigMap, a client/cookie Secret, and an optional OIDC CA ConfigMap.
-It installs the gateway first, checks the gateway CA Secret,
-and installs the dashboard with that CA and the internal gateway Service URL.
-Both releases use OpenShift-assigned UID/GID settings. It waits for Helm readiness
-and checks Route admission for each configured hostname. Admission for an old
-dashboard hostname does not satisfy this check. Set `--timeout 15m` for a slower
-cluster.
+For a custom or host-network router, provide reviewed `networkPolicy.ingressFrom`
+peers in the dashboard override file instead of the default `openshift-ingress`
+namespace identity.
+
+## Validate, preflight, and install
+
+```shell
+./install.py validate
+./install.py preflight
+./install.py install
+```
+
+A bare invocation is a usage error, never an install.
+
+`validate` is offline. It validates the config, merges override files, and
+renders both charts with `helm pull` and `helm template`. It downloads the
+pinned charts but does not check connectivity, SCC admission, token claims, or
+runtime behavior. It reads the client secret file's existence and size, not its
+contents, and performs no RHOAI CSV lookup.
+
+`preflight` renders both charts and then checks the cluster without mutating it:
+
+- The supported served Sandbox API and the Agent Sandbox controller rollout.
+- The default StorageClass and the configured `workspaceStorageClass`.
+- Create/patch permissions for installation resources and update/delete
+  permissions for Helm release Secrets, including history pruning.
+- Route hosts claimed by any other namespace.
+- Release and cross-namespace identity conflicts.
+- External credential references and their required keys.
+- RHOAI product images against the operator CSV.
+
+`install` repeats preflight, creates the namespace when missing, records the
+installer identity, creates installer-owned credentials, installs the gateway,
+checks its CA Secret, and installs the dashboard with that CA and the internal
+gateway Service URL. It waits for Helm readiness and Route admission. Set
+`--timeout 15m` for a slower cluster.
+
+For source-chart rendering, use `validate --gateway-chart-directory <path>
+--dashboard-chart-directory <path>`. These flags exist only on `validate`, so an
+offline render cannot touch a cluster. Source charts carry version `0.0.0`, so
+this path renders images with the versions from your config; it is not an
+install path.
+
+## Several installations behind one provider
+
+One gateway/dashboard pair runs per namespace. Repeated installations are a
+first-class workflow: each has its own working directory, hosts, browser client,
+audience, callback URL, and access assignments. Start a second installation in
+its own directory and seed only the shared identity settings:
+
+```shell
+mkdir -p ../team-b && cd ../team-b
+cp ../openshell-on-rhoai/install.py .
+./install.py init \
+  --from-config ../openshell-on-rhoai/config.json \
+  --namespace team-b \
+  --cluster-app-domain "$APPS_DOMAIN" \
+  --rhoai-version 3.6
+```
+
+`--from-config` copies `provider`, `issuer`, `ca_file`/`ca_configmap`,
+`roles_claim`, `admin_role`, `user_role`, and `scope`. It never copies the
+namespace, hosts, client ID, audience, client secret, or access assignments. A
+relative `ca_file` in the source becomes an absolute path. Each generated
+config is self-contained; there is no shared runtime file to drift.
+
+Register `https://<dashboard-host>/oauth2/callback` with the IdP for that
+namespace's browser client. Provision a distinct API audience and browser client
+per gateway, even when gateways share an issuer. `--namespace` does not rewrite
+OIDC identifiers or create IdP clients. Preflight rejects an issuer/audience or
+issuer/browser-client pair already recorded by another installer-managed
+namespace, and rejects a Route host already claimed by another namespace.
+
+## Reruns, upgrades, and failures
+
+Rerun the same command after correcting a failure. The fixed release names
+provide one gateway/dashboard pair per namespace. An existing gateway chart under
+a different release name, either fixed release without installer state, or
+unmanaged gateway TLS/JWT Secrets requires explicit migration. Unrelated Helm
+releases are left alone. Preflight inspects stored Helm workloads for the
+`openshell-gateway` container or executable, so renaming the chart or overriding
+its image does not bypass gateway detection.
+
+The `openshell-installer` ConfigMap records the gateway host, issuer, audience,
+browser client ID, and credential ownership. Changing the recorded identity or
+hostname requires explicit migration. Legacy state is populated on the next
+successful install without rewriting existing values; concurrent updates use a
+resource-version precondition.
+
+The installer preserves existing client and cookie secrets. A first installation
+requires a client secret file or an existing Secret. A provided file that differs
+from the existing Secret causes an error; rotate credentials explicitly and
+restart the consuming pods. Removing `ca_file` removes the mounts on the next
+upgrade but does not delete the old ConfigMap.
+
+Change the pinned versions or the profile to upgrade. Both releases receive the
+generated values with `--reset-values`, so out-of-band Helm edits are not
+preserved. There is no cross-release transaction: a successful gateway upgrade
+followed by a failed dashboard upgrade leaves the upgraded gateway in place.
+Failed releases, namespaces, Secrets, PVCs, and installer state are preserved for
+diagnosis.
+
+## Uninstall
+
+```shell
+./install.py uninstall
+```
+
+`uninstall` removes the Helm releases and the resources the installer owns. It
+never deletes the namespace.
+
+Before anything destructive it proves ownership: the `openshell-installer`
+ConfigMap carries `openshell.ai/installer=odh-dashboard`, or the namespace carries
+that label, or it has the legacy `openshell.ai/installer-gateway-host`
+annotation. A namespace without that proof is refused by name, which makes
+`uninstall --namespace` safe.
+
+It discovers installed releases from `helm list` rather than trusting the
+config, then prints the full inventory. On a terminal it asks you to type the
+namespace name; when stdin is not a terminal it requires `--yes`.
+
+Teardown is ordered and resumable:
+
+1. The dashboard release first, because it depends on the gateway's TLS material
+   and the OIDC Secret.
+2. The gateway release.
+3. The three hook-created TLS Secrets (`openshell-server-tls`,
+   `openshell-client-tls`, `openshell-jwt-keys`). The chart's certgen hook
+   creates them at runtime, outside the release manifest and without Helm
+   labels, so `helm uninstall` never removes them. Their names are
+   installer-fixed, and deletion rides on the ownership proof above.
+4. Installer-owned credentials only. `openshell-dashboard-oidc` and
+   `openshell-oidc-ca` are deleted when the installer created them. A Secret
+   named by `oidc.client_secret_secret` or a ConfigMap named by
+   `oidc.ca_configmap` is administrator-managed and is preserved, even when it
+   reuses a fixed installer name.
+5. `openshell-installer`, only after every earlier step succeeded.
+
+Dependent cleanup respects failures. If the dashboard release cannot be removed,
+the gateway, TLS Secrets, credentials, and state are retained because the
+surviving dashboard still needs them. If the gateway cannot be removed, the TLS
+Secrets, credentials, and state are retained. A failed secret or ConfigMap
+deletion preserves the state so a rerun passes the ownership gate and finishes
+the job. The command names every retained resource and exits non-zero. Rerun it
+after fixing the cause.
+
+Cluster-scoped RBAC belongs to the Helm releases. The installer never deletes it
+by label, because the label is namespace-agnostic and would remove another
+installation's RBAC. It reports survivors by name.
+
+The namespace itself is kept, so anything else deployed there is untouched. To
+remove it too, do so explicitly as a separate, optional step:
+
+```shell
+oc delete namespace openshell-team
+```
+
+## Gateway-only install (advanced)
+
+The installer deliberately installs both components. For gateway-only, run a
+plain Helm install of the gateway chart: the coupling runs one way — the
+dashboard needs the gateway's CA and internal Service URL, while the gateway
+knows nothing about the dashboard. A manual gateway-only install also drops the
+dashboard's external OCI chart dependency and needs no browser OIDC client. Only
+the API audience client and the CLI client from the Keycloak guide are required.
+
+Cover the prerequisites preflight would otherwise check: Agent Sandbox CRDs and
+a running controller, a default block-backed StorageClass, an application
+namespace, and permission to create the cluster-scoped RBAC the chart needs.
+
+Create `gateway-only.yaml` mirroring the gateway half of the installer's
+rendered values. `install.py`'s `chart_values` is the reference implementation:
+
+```yaml
+fullnameOverride: openshell
+podSecurityContext: null
+securityContext:
+  runAsUser: null
+  seccompProfile:
+    type: RuntimeDefault
+replicaCount: 1
+server:
+  disableTls: false
+  sandboxNamespace: openshell-team
+  auth:
+    allowUnauthenticatedUsers: false
+  tls:
+    enableMtls: false
+    clientCaSecretName: ""
+    certSecretName: openshell-server-tls
+    clientTlsSecretName: openshell-client-tls
+  oidc:
+    issuer: https://identity.example.com/realms/customer
+    audience: openshell-api-openshell-team
+    rolesClaim: roles
+    adminRole: openshell-admin
+    userRole: openshell-user
+    # caConfigMapName: openshell-oidc-ca  # only for a private CA
+pkiInitJob:
+  enabled: true
+  serverDnsNames:
+    - gateway-openshell-team.apps.example.com
+    - openshell.openshell-team.svc
+    - openshell.openshell-team.svc.cluster.local
+openshiftRoute:
+  enabled: true
+  host: gateway-openshell-team.apps.example.com
+```
+
+If the issuer uses a private CA, create the ConfigMap yourself; the gateway
+chart does not create it:
+
+```shell
+oc -n openshell-team create configmap openshell-oidc-ca --from-file=ca.crt=issuer.pem
+```
+
+Install with an exact chart version:
+
+```shell
+helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.1.3 \
+  --namespace openshell-team \
+  --values gateway-only.yaml \
+  --wait --wait-for-jobs --timeout 10m
+```
+
+This path gives up preflight checks, the cross-namespace identity reservation,
+Route-admission waiting, and `uninstall`. Teardown is `helm uninstall openshell`
+plus removing the three hook-created TLS Secrets, which Helm orphans:
+
+```shell
+helm uninstall openshell -n openshell-team
+oc -n openshell-team delete secret openshell-server-tls openshell-client-tls openshell-jwt-keys
+```
+
+Registering the gateway with the CLI works identically after a manual install.
 
 ## TLS and onboarding
 
 The gateway uses the chart's PKI bootstrap hook and a passthrough Route. Generated
-server SANs include the gateway public hostname and namespace-specific Service
-names. This initial mode uses a private gateway CA: export and distribute its
-`ca.crt` from `openshell-client-tls` through your trusted administrator process.
-Register the gateway using the installed CLI's CA options from
-`openshell gateway add --help`; do not disable certificate verification.
-TLS client-certificate authentication is disabled for this OIDC-only deployment.
-Supervisors retain gateway-minted sandbox JWT authentication.
+server SANs include the gateway public host and namespace-specific Service names.
+This OIDC-only mode uses a private gateway CA: export and distribute its `ca.crt`
+from `openshell-client-tls` through a trusted administrator process. Register the
+gateway with the installed CLI's CA options from `openshell gateway add --help`;
+do not disable certificate verification. TLS client-certificate authentication
+is disabled; supervisors retain gateway-minted sandbox JWT authentication.
 
 The dashboard uses an edge Route and trusts the gateway CA for internal calls.
-Its authentication proxy is the only exposed dashboard port. The OpenShift
-router defaults to the `openshift-ingress` namespace network identity. For a
-custom or host-network router, provide reviewed `networkPolicy.ingressFrom`
-peers in dashboard values instead; retain ingress restricted to your router.
+Its authentication proxy is the only exposed dashboard port. After installation,
+verify administrator and standard-user login, denied cross-workspace access,
+sandbox creation and deletion, and terminal WebSockets before sharing the
+deployment. Readiness and Route admission alone do not prove that flow works.
 
-Configure a CLI OIDC registration separately with your IdP. After installation,
-verify administrator and standard-user login. Administrators add workspace
-memberships using the token's subject ID. Verify denied cross-workspace access,
-sandbox creation/deletion, and terminal WebSockets before sharing the deployment.
-Readiness and Route admission alone do not prove this flow works.
+## Authorization verification
 
-Use the read-only verifier after provisioning two distinct identities and two
-existing workspaces. The admin must access both workspaces; the ordinary user
-must belong only to the allowed workspace. Save fresh access tokens in files
-with mode `0600` outside the checkout, using your IdP's supported login flow:
+The read-only verifier stays a separate script, run from the checkout, because it
+probes authorization with two bearer tokens and two existing workspaces and
+shares none of the installer config. Save fresh access tokens in files with mode
+`0600` outside the checkout:
 
 ```shell
 uv run --script --python 3.12 deploy/rhoai/verify.py \
-  --context YOUR_CONTEXT --namespace research-team \
-  --dashboard-url https://dashboard.apps.example.com \
+  --context YOUR_CONTEXT --namespace openshell-team \
+  --dashboard-url https://dashboard-openshell-team.apps.example.com \
   --admin-role openshell-admin \
   --admin-token-file /secure/admin-token.txt \
   --user-token-file /secure/user-token.txt \
   --allowed-workspace team-a --denied-workspace team-b
 ```
 
-The verifier checks public unauthenticated rejection, gateway identity/roles,
+The verifier checks public unauthenticated rejection, gateway identity and roles,
 admin access to both workspaces, ordinary-user access to one and denial in the
-other. It opens a temporary loopback-only port-forward to the BFF to test gateway
-authorization with bearer tokens; this requires `pods/portforward` permission.
-It performs GET requests only and does not change users, memberships, or workloads.
-It closes its port-forward on success or failure and never follows redirects
-with credentials or prints tokens/response bodies.
+other. It opens a temporary loopback-only port-forward to the BFF, which requires
+`pods/portforward` permission. It performs GET requests only. It never follows
+redirects with credentials or prints tokens or response bodies.
 
 Optional `--other-gateway-token-file` checks rejection of a token for another
-gateway. First confirm that token works on its intended gateway: an expired or
-otherwise invalid token cannot prove audience isolation. This check requires
-HTTP 401; HTTP 403 fails because it can indicate successful authentication
-followed by a role denial. Optional
-`--session-cookie-file` accepts the Cookie header value from an already logged-in
-browser and checks the public session endpoint. `--ca-file` adds a private Route
-CA to system trust. These checks do not automate browser login, grant/revoke,
-sandbox creation/deletion, terminal execution, or network-policy enforcement.
+gateway; first confirm that token works on its intended gateway. Optional
+`--session-cookie-file` checks the public session endpoint with a browser Cookie
+header. `--ca-file` adds a private Route CA to system trust. The verifier does
+not automate browser login, grant/revoke, sandbox lifecycle, terminal execution,
+or network-policy enforcement.
 
-## Reruns, upgrades, and failures
+## Live validation
 
-Rerun the same command after correcting a failure. The administrator selects the
-namespace; it does not need an installer ownership label. The fixed release names
-provide one gateway/dashboard pair per namespace. An existing gateway chart under
-a different release name, or either fixed release without installer state, is
-rejected and needs explicit migration. Unmanaged gateway TLS/JWT Secrets are also
-rejected so the bootstrap hook cannot silently reuse another gateway's identity.
-Unrelated Helm releases in the selected namespace are left alone.
-Preflight inspects stored Helm workload manifests for the `openshell-gateway`
-container or executable, so renaming the chart or overriding its image does not
-bypass gateway detection. Failed releases and scaled-to-zero gateways count too.
-Custom packaging must retain one of these markers; workloads outside Helm or
-with both markers removed require administrator inspection.
-Uninstalled releases retained under another name do not count as active gateways;
-conflicting remaining TLS/JWT Secrets and fixed release names still require
-explicit migration.
+On October 13, 2026, the installer was exercised on an OpenShift `4.21.8` cluster
+with RHOAI installed, OVN Kubernetes, `gp3-csi` storage, Agent Sandbox `v1.0.6`,
+and an existing Red Hat build of Keycloak `26.4.10`. A dedicated test realm
+supplied OIDC; existing customer realms were not changed.
 
-The original gateway hostname is recorded in the `openshell-installer` ConfigMap.
-Issuer, API audience, and browser client ID are recorded too; changing them
-requires an explicit identity migration. Legacy state is populated on a successful
-preflight followed by an install/rerun without rewriting existing identity values.
-Legacy updates use a resource-version precondition. If another run changes the
-state concurrently, installation stops without overwriting it; inspect the
-recorded identity and rerun preflight before retrying.
-Earlier installations recorded it on the namespace; reruns migrate that state
-without changing namespace metadata. Changing the recorded hostname is
-rejected because the certificate hook preserves existing certificates; migrate
-the certificate and endpoint explicitly rather than editing installer state.
+The following checks passed with gateway chart `0.1.3` and dashboard chart
+`0.1.0` using the charts' default upstream images:
 
-The installer preserves existing client and cookie secrets. You may omit
-`client_secret_file` only when installer state exists. A first installation requires
-the file even if `openshell-dashboard-oidc` already exists; the supplied client
-secret must match before that Secret is reused. Preflight validates local
-credential files without reading namespaced objects when the namespace is absent.
-A provided secret or private OIDC CA that differs from the existing object causes
-an error; rotate credentials explicitly and restart the consuming pods.
-Removing `ca_file` removes the mounts
-on the next upgrade, but does not delete the old ConfigMap.
+- First installation into a new namespace and a rerun with the same inputs.
+- Installation and rerun in a pre-created namespace with both releases reaching
+  revision 2 and the namespace's labels, annotations, and SCC allocations
+  preserved.
+- Gateway readiness, both dashboard containers ready, and persistent storage
+  bound.
+- Public HTTPS routing and HTTP 401 for unauthenticated dashboard API requests.
+- Browser OIDC redirect/login/callback and authenticated workspace and gateway
+  API calls.
+- Sandbox creation through the dashboard API, supervisor readiness, authenticated
+  terminal WebSocket execution with exit code 0, and completed deletion.
+- Read-only authorization verification, including denied access after membership
+  revocation.
 
-Change the pinned versions to upgrade. Both Helm releases receive the generated
-values with `--reset-values`, including the configured values files, so out-of-band
-Helm value edits are not preserved.
-There is no cross-release transaction or automatic rollback: gateway success
-followed by dashboard failure leaves the upgraded gateway in place. Failed
-releases, namespaces, Secrets, and PVCs are preserved for diagnosis.
-
-Inspect the two Helm releases, namespace pods/events, and the `openshell` and
-`openshell-dashboard` Routes with the same explicit kubeconfig context. For
-sandbox failures, inspect Agent Sandbox, SCC admission, storage, supervisor logs,
-and NetworkPolicy enforcement. Namespace deletion is never part of this script.
-
-## Image overrides
-
-Optional `gateway.images` accepts `gateway`, `supervisor`, `sandboxRuntime`, and
-`sandbox` objects. Optional `dashboard.images` accepts `dashboard` and `authProxy`.
-Each object accepts `registry`, `repository`, `tag`, and `digest`, using the chart's
-image semantics. For example:
-
-```json
-"images": {
-  "gateway": {
-    "registry": "quay.io",
-    "repository": "your-org/openshell-gateway",
-    "digest": "sha256:<verified-image-digest>"
-  }
-}
-```
-
-Pin compatible runtime and UI images as well as chart versions. The default
-workload image uses a complete registry/repository path in `sandbox.repository`
-(within `gateway.images.sandbox`); its chart does not use a separate registry key.
-Image overrides do not establish FIPS qualification.
+These checks do not establish the RHOAI product-image combination, FIPS
+qualification, production certificate renewal, or a full UI interaction test.
+The `3.6.0` profile remains marked unqualified until the frozen 3.6 build passes
+the same checks with the `registry.redhat.io` images. The live configuration and
+credentials are kept outside the repository. Record the OpenShift version, RHOAI
+version and operator CSV, chart versions, product image digests from that CSV,
+Agent Sandbox version, and the `authProxy` digest when a build is qualified.
 
 ## Contributor validation
 
@@ -364,11 +582,8 @@ this directory. It needs no cluster credentials or IdP. Run them locally with:
 ```shell
 uv run --script --python 3.12 deploy/rhoai/test_install.py
 uv run --no-project --python 3.12 deploy/rhoai/test_verify.py
+uvx ruff==0.14.14 check deploy/rhoai
+uvx ruff==0.14.14 format --check deploy/rhoai
 ```
 
-For source-chart rendering, use `--check --gateway-chart-directory <path>
---dashboard-chart-directory <path>`. These overrides are rejected for installation.
-Source charts carry version `0.0.0`, so this check renders images with the versions
-from your configuration. The gateway source originally selected for this work is
-`348a1fc62566892ba5530ac9f35acc983e4d9324`; a source commit is not a published OCI
-chart version. Resolve it to the intended release before installing.
+`mise.toml` deliberately excludes `deploy/rhoai` from its Python paths.

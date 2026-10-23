@@ -9,9 +9,12 @@
 import base64
 import copy
 import importlib.util
+import io
 import json
+import os
 import tempfile
 import unittest
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,7 +27,6 @@ spec.loader.exec_module(installer)
 
 def configuration():
     config = json.loads(Path(__file__).with_name("config.example.json").read_text())
-    config["context"] = "test-context"
     config["gateway"]["version"] = "0.1.3"
     config["dashboard"]["version"] = "0.1.7"
     config["oidc"].pop("client_secret_file")
@@ -32,8 +34,8 @@ def configuration():
 
 
 class FakeCluster(installer.Installer):
-    def __init__(self, config):
-        super().__init__(config, "10m")
+    def __init__(self, config, timeout="10m", context=None):
+        super().__init__(config, timeout, context)
         self.objects = {
             ("crd", "sandboxes.agents.x-k8s.io"): {
                 "spec": {"versions": [{"name": "v1beta1", "served": True}]}
@@ -43,6 +45,12 @@ class FakeCluster(installer.Installer):
         self.releases = []
         self.manifests = {}
         self.fail_dashboard = False
+        self.fail_gateway = False
+        self.fail_delete = set()
+        self.current_context = "fake-context"
+        self.csvs = []
+        self.routes = []
+        self.cluster_rbac = []
         self.storage = [
             {
                 "metadata": {
@@ -58,6 +66,19 @@ class FakeCluster(installer.Installer):
 
     def run(self, args, payload=None):
         self.calls.append((args, payload))
+        if args[0] == "kubectl" and "csv" in args:
+            return json.dumps({"items": self.csvs})
+        if args[0] == "kubectl" and "routes" in args and "--all-namespaces" in args:
+            return json.dumps({"items": self.routes})
+        if args[0] == "kubectl" and args[1:3] == ["config", "view"]:
+            contexts = [{"name": "fake-context", "context": {"cluster": "fake"}}]
+            if self.context:
+                contexts.append(
+                    {"name": self.context, "context": {"cluster": "context-cluster"}}
+                )
+            return json.dumps(
+                {"current-context": self.current_context, "contexts": contexts}
+            )
         if (
             args[0] == "kubectl"
             and "-n" in args
@@ -82,6 +103,28 @@ class FakeCluster(installer.Installer):
             return json.dumps({"items": []})
         if "--all-namespaces" in args:
             return json.dumps({"items": self.other_states})
+        if any(arg.startswith("clusterroles") for arg in args) and "-l" in args:
+            # kubectl parses a second space-separated resource as a NAME, which
+            # it rejects when a selector is present. Emulate that so argv
+            # regressions surface here instead of only against a real cluster.
+            start = args.index("get") + 1
+            resources = []
+            for token in args[start:]:
+                if token.startswith("-"):
+                    break
+                resources.append(token)
+            if len(resources) > 1:
+                raise RuntimeError(
+                    "name cannot be provided when a selector is specified"
+                )
+            return json.dumps({"items": self.cluster_rbac})
+        if args[0] == "kubectl" and "delete" in args:
+            index = args.index("delete")
+            keys = [args[index + 1], args[index + 2]]
+            if any(key in self.fail_delete for key in keys):
+                raise RuntimeError(f"cannot delete {keys[-1]}")
+            self.objects.pop((keys[0], keys[1]), None)
+            return ""
         if "patch" in args:
             state = self.objects[("configmap", installer.INSTALL_STATE)]
             patch_data = json.loads(args[args.index("-p") + 1])
@@ -94,8 +137,24 @@ class FakeCluster(installer.Installer):
             )
             return ""
         if args[:2] == ["helm", "list"]:
-            offset = int(args[args.index("--offset") + 1])
+            offset = int(args[args.index("--offset") + 1]) if "--offset" in args else 0
             return json.dumps(self.releases[offset : offset + 256])
+        if args[:2] == ["helm", "uninstall"]:
+            name = args[2]
+            if self.fail_dashboard and name == "openshell-dashboard":
+                raise RuntimeError("dashboard uninstall failed")
+            if self.fail_gateway and name == "openshell":
+                raise RuntimeError("gateway uninstall failed")
+            self.releases = [
+                release for release in self.releases if release["name"] != name
+            ]
+            return ""
+        if args[:2] == ["helm", "pull"]:
+            destination = Path(args[args.index("--destination") + 1])
+            (destination / "chart.tgz").write_bytes(b"fake")
+            return ""
+        if args[:2] == ["helm", "template"]:
+            return ""
         if args[:3] == ["helm", "get", "manifest"]:
             return self.manifests.get(args[3], "")
         if args[:2] == ["helm", "upgrade"]:
@@ -145,6 +204,14 @@ class InstallTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.config = configuration()
+        # The example config wires in the override files; provide them beside
+        # every generated config.json just like init does.
+        for component in ("gateway", "dashboard"):
+            (self.root / f"{component}-overrides.yaml").write_text(
+                Path(__file__)
+                .with_name(f"{component}-overrides.example.yaml")
+                .read_text()
+            )
 
     def load(self):
         path = self.root / "config.json"
@@ -187,7 +254,7 @@ class InstallTests(unittest.TestCase):
         (self.root / "site.yaml").write_text(
             "resources:\n  requests:\n    cpu: 200m\nimagePullSecrets:\n  - name: registry-creds\n"
         )
-        self.config["gateway"]["values_files"] = ["base.yaml", "site.yaml"]
+        self.config["gateway"]["helm_overrides"] = ["base.yaml", "site.yaml"]
         self.config["oidc"]["scope"] = "openid email profile offline_access"
         gateway, dashboard = installer.chart_values(self.load())
         self.assertEqual(
@@ -213,7 +280,7 @@ class InstallTests(unittest.TestCase):
             with self.subTest(overlay=overlay):
                 self.config = configuration()
                 (self.root / "site.yaml").write_text(overlay)
-                self.config[name]["values_files"] = ["site.yaml"]
+                self.config[name]["helm_overrides"] = ["site.yaml"]
                 with self.assertRaises(ValueError):
                     self.load()
 
@@ -403,7 +470,10 @@ class InstallTests(unittest.TestCase):
         ]
         self.assertEqual(len(patches), 1)
         self.assertEqual(patches[0]["metadata"], {"resourceVersion": "1"})
-        self.assertEqual(set(patches[0]["data"]), {"oidc-audience", "oidc-client-id"})
+        self.assertEqual(
+            set(patches[0]["data"]),
+            {"oidc-audience", "oidc-client-id", "oidc-secret-source", "oidc-ca-source"},
+        )
         cluster.calls.clear()
         cluster.install(["g", "d"], ["g", "d"])
         self.assertFalse(
@@ -532,6 +602,15 @@ class InstallTests(unittest.TestCase):
 
         def run(_instance, args, payload=None):
             self.assertIsNone(payload)
+            if args[1:3] == ["config", "view"]:
+                return json.dumps(
+                    {
+                        "current-context": "test-context",
+                        "contexts": [
+                            {"name": "test-context", "context": {"cluster": "cluster"}}
+                        ],
+                    }
+                )
             if args[:2] == ["helm", "pull"]:
                 (Path(args[args.index("--destination") + 1]) / "chart.tgz").write_bytes(
                     b"fake"
@@ -539,7 +618,7 @@ class InstallTests(unittest.TestCase):
             return ""
 
         with (
-            patch("sys.argv", ["install.py", "--config", str(path), "--preflight"]),
+            patch("sys.argv", ["install.py", "preflight", "--config", str(path)]),
             patch.object(installer.shutil, "which", return_value="tool"),
             patch.object(installer.Installer, "run", run),
             patch.object(installer.Installer, "preflight") as preflight,
@@ -787,7 +866,8 @@ class InstallTests(unittest.TestCase):
         )
         for args, _ in cluster.calls:
             self.assertNotIn("a-secret-that", " ".join(args))
-            self.assertIn("test-context", args)
+            self.assertNotIn("--context", args)
+            self.assertNotIn("--kube-context", args)
             self.assertNotIn("--atomic", args)
             if "can-i" not in args:
                 self.assertNotIn("delete", args)
@@ -981,6 +1061,15 @@ class InstallTests(unittest.TestCase):
 
         def run(_instance, args, payload=None):
             self.assertIsNone(payload)
+            if args[1:3] == ["config", "view"]:
+                return json.dumps(
+                    {
+                        "current-context": "test-context",
+                        "contexts": [
+                            {"name": "test-context", "context": {"cluster": "cluster"}}
+                        ],
+                    }
+                )
             commands.append(args)
             if args[:2] == ["helm", "pull"]:
                 destination = Path(args[args.index("--destination") + 1])
@@ -989,7 +1078,7 @@ class InstallTests(unittest.TestCase):
             raise RuntimeError("invalid chart values")
 
         with (
-            patch("sys.argv", ["install.py", "--config", str(path)]),
+            patch("sys.argv", ["install.py", "install", "--config", str(path)]),
             patch.object(installer.shutil, "which", return_value="tool"),
             patch.object(installer.Installer, "run", run),
             self.assertRaisesRegex(RuntimeError, "invalid chart values"),
@@ -997,7 +1086,7 @@ class InstallTests(unittest.TestCase):
             installer.main()
         self.assertTrue(all(args[0] == "helm" for args in commands))
 
-    def test_check_only_never_calls_kubectl(self):
+    def test_validate_never_calls_kubectl(self):
         path = self.root / "config.json"
         path.write_text(json.dumps(self.config))
         for chart in ("gateway", "dashboard"):
@@ -1005,9 +1094,9 @@ class InstallTests(unittest.TestCase):
             (self.root / chart / "Chart.yaml").write_text("version: 0.0.0\n")
         argv = [
             "install.py",
+            "validate",
             "--config",
             str(path),
-            "--check",
             "--namespace",
             "render-project",
             "--gateway-chart-directory",
@@ -1026,6 +1115,1012 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(call.args[0][:2], ["helm", "template"])
             args = call.args[0]
             self.assertEqual(args[args.index("--namespace") + 1], "render-project")
+
+    # --- lifecycle CLI ---------------------------------------------------
+
+    @contextmanager
+    def working_directory(self, directory=None):
+        original = Path.cwd()
+        os.chdir(directory or self.root)
+        try:
+            yield Path.cwd()
+        finally:
+            os.chdir(original)
+
+    def run_main(self, argv):
+        output = io.StringIO()
+        with patch("sys.argv", ["install.py", *argv]), redirect_stdout(output):
+            installer.main()
+        return output.getvalue()
+
+    def init(self, *args):
+        return self.run_main(["init", *args])
+
+    def installed_cluster(self):
+        cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {
+            "metadata": {"labels": {installer.OWNER: installer.OWNER_VALUE}}
+        }
+        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        cluster.objects[("secret", "openshell-server-tls")] = {"data": {}}
+        cluster.objects[("secret", "openshell-jwt-keys")] = {"data": {}}
+        cluster.calls.clear()
+        return cluster
+
+    @staticmethod
+    def uninstall(cluster):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            try:
+                cluster.uninstall(assume_yes=True)
+            except ValueError as error:
+                return output.getvalue(), error
+        return output.getvalue(), None
+
+    def deletion_sequence(self, cluster):
+        sequence = []
+        for args, _ in cluster.calls:
+            if args[:2] == ["helm", "uninstall"]:
+                sequence.append(args[2])
+            if args[0] == "kubectl" and "delete" in args:
+                sequence.append(args[args.index("delete") + 2])
+        return sequence
+
+    def test_bare_invocation_and_lone_config_flag_are_usage_errors(self):
+        for argv in (["install.py"], ["install.py", "--config", "config.json"]):
+            with (
+                self.subTest(argv=argv),
+                patch("sys.argv", argv),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                installer.main()
+            self.assertEqual(caught.exception.code, 2)
+
+    def test_stale_config_fields_get_migration_messages(self):
+        self.config["context"] = "old-context"
+        with self.assertRaisesRegex(ValueError, "no longer a configuration field"):
+            self.load()
+        self.config = configuration()
+        self.config["gateway"]["values_files"] = []
+        with self.assertRaisesRegex(ValueError, "renamed to helm_overrides"):
+            self.load()
+
+    def test_missing_default_config_names_init(self):
+        with (
+            self.working_directory(self.root),
+            patch("sys.argv", ["install.py", "preflight"]),
+            patch.object(installer.shutil, "which", return_value="tool"),
+            self.assertRaisesRegex(ValueError, "No config.json in this directory"),
+        ):
+            installer.main()
+
+    def test_config_defaults_to_config_json_and_prints_resolved_path(self):
+        path = self.root / "config.json"
+        path.write_text(json.dumps(self.config))
+        commands = []
+
+        def run(_instance, args, payload=None):
+            self.assertIsNone(payload)
+            commands.append(args)
+            if args[:2] == ["helm", "pull"]:
+                (Path(args[args.index("--destination") + 1]) / "chart.tgz").write_bytes(
+                    b"fake"
+                )
+            return ""
+
+        with (
+            self.working_directory(self.root),
+            patch("sys.argv", ["install.py", "validate"]),
+            patch.object(installer.shutil, "which", return_value="tool"),
+            patch.object(installer.Installer, "run", run),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            installer.main()
+        self.assertIn(f"Config file: {path.resolve()}", output.getvalue())
+        self.assertEqual(len(commands), 4)
+
+    def test_config_reading_cluster_commands_print_the_resolved_path(self):
+        path = self.root / "config.json"
+        path.write_text(json.dumps(self.config))
+
+        def run(_instance, args, _payload=None):
+            if args[1:3] == ["config", "view"]:
+                return json.dumps(
+                    {
+                        "current-context": "ctx",
+                        "contexts": [{"name": "ctx", "context": {"cluster": "c"}}],
+                    }
+                )
+            if args[:2] == ["helm", "pull"]:
+                (Path(args[args.index("--destination") + 1]) / "chart.tgz").write_bytes(
+                    b"fake"
+                )
+            return ""
+
+        for command in ("preflight", "install"):
+            with (
+                self.subTest(command=command),
+                patch("sys.argv", ["install.py", command, "--config", str(path)]),
+                patch.object(installer.shutil, "which", return_value="tool"),
+                patch.object(installer.Installer, "run", run),
+                patch.object(installer.Installer, "preflight", return_value=None),
+                patch.object(installer.Installer, "install", return_value=None),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                installer.main()
+            text = output.getvalue()
+            self.assertIn(f"Config file: {path.resolve()}", text)
+            self.assertIn(self.config["oidc"]["issuer"], text)
+            self.assertIn(self.config["oidc"]["audience"], text)
+            self.assertIn(self.config["oidc"]["client_id"], text)
+            self.assertIn(
+                f"https://{self.config['dashboard']['host']}/oauth2/callback",
+                text,
+            )
+
+    def test_context_flag_reaches_cluster_calls_and_not_local_helm(self):
+        secret = self.root / "client.txt"
+        secret.write_text("secret\n")
+        self.config["oidc"]["client_secret_file"] = str(secret)
+        path = self.root / "config.json"
+        path.write_text(json.dumps(self.config))
+        created = []
+
+        class Recording(FakeCluster):
+            def __init__(self, config, timeout="10m", context=None):
+                super().__init__(config, timeout, context)
+                self.objects[("namespace", self.ns)] = {"metadata": {}}
+                created.append(self)
+
+        with (
+            patch(
+                "sys.argv",
+                ["install.py", "preflight", "--config", str(path), "--context", "ctx"],
+            ),
+            patch.object(installer.shutil, "which", return_value="tool"),
+            patch.object(installer, "Installer", Recording),
+        ):
+            installer.main()
+        for args, _ in created[0].calls:
+            if args[0] == "kubectl" and args[1:3] != ["config", "view"]:
+                self.assertIn("--context", args)
+                self.assertEqual(args[args.index("--context") + 1], "ctx")
+            if args[:2] in (["helm", "pull"], ["helm", "template"]):
+                self.assertNotIn("--kube-context", args)
+            elif args[0] == "helm":
+                self.assertIn("--kube-context", args)
+
+    def test_cluster_commands_refuse_empty_current_context(self):
+        cluster = self.cluster()
+        cluster.current_context = ""
+        with self.assertRaisesRegex(ValueError, "No kubectl context is set"):
+            cluster.audit_context()
+
+    def test_audit_identity_shows_resolved_values_without_rewriting(self):
+        cluster = self.cluster()
+        cluster.ns = "override-team"
+        with redirect_stdout(io.StringIO()) as output:
+            cluster.audit_identity()
+        text = output.getvalue()
+        self.assertIn(cluster.config["oidc"]["issuer"], text)
+        self.assertIn(cluster.config["oidc"]["audience"], text)
+        self.assertIn(cluster.config["oidc"]["client_id"], text)
+        self.assertIn(
+            f"https://{cluster.config['dashboard']['host']}/oauth2/callback", text
+        )
+        self.assertIn("override-team", text)
+        self.assertEqual(
+            cluster.config["oidc"]["client_id"], "openshell-dashboard-openshell-team"
+        )
+
+    # --- uninstall -------------------------------------------------------
+
+    def test_uninstall_refuses_unowned_namespace_before_any_deletion(self):
+        cluster = self.cluster()
+        cluster.objects[("namespace", cluster.ns)] = {
+            "metadata": {"labels": {"team": "research"}}
+        }
+        before = copy.deepcopy(cluster.objects)
+        _, error = self.uninstall(cluster)
+        self.assertIsNotNone(error)
+        self.assertIn("not installed by this installer", str(error))
+        self.assertEqual(cluster.objects, before)
+        self.assertFalse(any(args[0] == "helm" for args, _ in cluster.calls))
+        self.assertFalse(any("delete" in args for args, _ in cluster.calls))
+
+    def test_uninstall_removes_releases_then_secrets_with_state_last(self):
+        cluster = self.installed_cluster()
+        _, error = self.uninstall(cluster)
+        self.assertIsNone(error)
+        self.assertEqual(
+            self.deletion_sequence(cluster),
+            [
+                "openshell-dashboard",
+                "openshell",
+                *installer.TLS_SECRETS,
+                installer.OIDC_SECRET,
+                installer.INSTALL_STATE,
+            ],
+        )
+        self.assertIn(("namespace", cluster.ns), cluster.objects)
+        self.assertNotIn(("configmap", installer.INSTALL_STATE), cluster.objects)
+        self.assertNotIn(("secret", installer.OIDC_SECRET), cluster.objects)
+
+    def test_uninstall_with_absent_namespace_is_a_no_op(self):
+        cluster = self.cluster()
+        output, error = self.uninstall(cluster)
+        self.assertIsNone(error)
+        self.assertIn("nothing to uninstall", output)
+        self.assertFalse(any(args[0] == "helm" for args, _ in cluster.calls))
+
+    def test_uninstall_requires_yes_without_a_terminal(self):
+        cluster = self.installed_cluster()
+        before = copy.deepcopy(cluster.objects)
+        with (
+            patch("sys.stdin.isatty", return_value=False),
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "--yes"),
+        ):
+            cluster.uninstall()
+        self.assertEqual(cluster.objects, before)
+        self.assertFalse(
+            any(args[:2] == ["helm", "uninstall"] for args, _ in cluster.calls)
+        )
+
+    def test_uninstall_prompt_requires_typing_the_namespace(self):
+        cluster = self.installed_cluster()
+        before = copy.deepcopy(cluster.objects)
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="wrong"),
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "did not match"),
+        ):
+            cluster.uninstall()
+        self.assertEqual(cluster.objects, before)
+
+    def test_dashboard_removal_failure_skips_all_dependent_cleanup(self):
+        cluster = self.installed_cluster()
+        cluster.fail_dashboard = True
+        output, error = self.uninstall(cluster)
+        self.assertIn("uninstall incomplete", str(error))
+        self.assertIn("Retained resources", output)
+        self.assertEqual(
+            {release["name"] for release in cluster.releases},
+            {"openshell", "openshell-dashboard"},
+        )
+        for key in (
+            ("configmap", installer.INSTALL_STATE),
+            ("secret", installer.OIDC_SECRET),
+            ("secret", "openshell-server-tls"),
+        ):
+            self.assertIn(key, cluster.objects)
+        # Only the attempted (failed) dashboard removal is recorded; nothing
+        # else was touched.
+        self.assertEqual(self.deletion_sequence(cluster), ["openshell-dashboard"])
+
+    def test_gateway_removal_failure_skips_tls_and_credentials(self):
+        cluster = self.installed_cluster()
+        cluster.fail_gateway = True
+        _, error = self.uninstall(cluster)
+        self.assertIn("uninstall incomplete", str(error))
+        self.assertEqual(
+            [release["name"] for release in cluster.releases], ["openshell"]
+        )
+        for key in (
+            ("configmap", installer.INSTALL_STATE),
+            ("secret", installer.OIDC_SECRET),
+            ("secret", "openshell-server-tls"),
+        ):
+            self.assertIn(key, cluster.objects)
+        self.assertEqual(
+            self.deletion_sequence(cluster),
+            ["openshell-dashboard", "openshell"],
+        )
+
+    def test_secret_deletion_failure_preserves_state_and_rerun_completes(self):
+        cluster = self.installed_cluster()
+        cluster.fail_delete = {"openshell-server-tls"}
+        _, error = self.uninstall(cluster)
+        self.assertIn("uninstall incomplete", str(error))
+        self.assertIn(("configmap", installer.INSTALL_STATE), cluster.objects)
+        self.assertIn(("secret", "openshell-server-tls"), cluster.objects)
+        # Independent cleanup still ran.
+        self.assertNotIn(("secret", installer.OIDC_SECRET), cluster.objects)
+        cluster.fail_delete = set()
+        cluster.calls.clear()
+        _, error = self.uninstall(cluster)
+        self.assertIsNone(error)
+        self.assertNotIn(("configmap", installer.INSTALL_STATE), cluster.objects)
+        self.assertNotIn(("secret", "openshell-server-tls"), cluster.objects)
+
+    def test_credential_deletion_failure_preserves_state_and_rerun_completes(self):
+        cluster = self.installed_cluster()
+        cluster.fail_delete = {installer.OIDC_SECRET}
+        _, error = self.uninstall(cluster)
+        self.assertIn("openshell-dashboard-oidc", str(error))
+        self.assertIn(("configmap", installer.INSTALL_STATE), cluster.objects)
+        cluster.fail_delete = set()
+        _, error = self.uninstall(cluster)
+        self.assertIsNone(error)
+        self.assertNotIn(("configmap", installer.INSTALL_STATE), cluster.objects)
+        self.assertNotIn(("secret", installer.OIDC_SECRET), cluster.objects)
+
+    def test_uninstall_works_from_namespace_alone_without_a_config_line(self):
+        def run(_instance, args, _payload=None):
+            if args[1:3] == ["config", "view"]:
+                return json.dumps(
+                    {
+                        "current-context": "ctx",
+                        "contexts": [{"name": "ctx", "context": {"cluster": "c"}}],
+                    }
+                )
+            return ""
+
+        with (
+            self.working_directory(self.root),
+            patch("sys.argv", ["install.py", "uninstall", "--namespace", "team-a"]),
+            patch.object(installer.shutil, "which", return_value="tool"),
+            patch.object(installer.Installer, "run", run),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            installer.main()
+        self.assertIn("nothing to uninstall", output.getvalue())
+        self.assertNotIn("Config file:", output.getvalue())
+
+    def test_uninstall_with_default_config_prints_the_config_line(self):
+        path = self.root / "config.json"
+        path.write_text(json.dumps(self.config))
+
+        def run(_instance, args, _payload=None):
+            if args[1:3] == ["config", "view"]:
+                return json.dumps(
+                    {
+                        "current-context": "ctx",
+                        "contexts": [{"name": "ctx", "context": {"cluster": "c"}}],
+                    }
+                )
+            return ""
+
+        with (
+            self.working_directory(self.root),
+            patch("sys.argv", ["install.py", "uninstall"]),
+            patch.object(installer.shutil, "which", return_value="tool"),
+            patch.object(installer.Installer, "run", run),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            installer.main()
+        self.assertIn(f"Config file: {path.resolve()}", output.getvalue())
+
+    def test_uninstall_without_config_or_namespace_errors_naming_both(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        with (
+            self.working_directory(empty),
+            patch("sys.argv", ["install.py", "uninstall"]),
+            patch.object(installer.shutil, "which", return_value="tool"),
+            self.assertRaisesRegex(ValueError, "--namespace or --config"),
+        ):
+            installer.main()
+
+    def test_uninstall_reports_cluster_scoped_rbac_survivors(self):
+        cluster = self.installed_cluster()
+        cluster.cluster_rbac = [
+            {"metadata": {"name": "node-reader"}},
+            {"metadata": {"name": "node-reader"}},
+            {"metadata": {"name": "dashboard-reader"}},
+        ]
+        output, error = self.uninstall(cluster)
+        self.assertIsNone(error)
+        self.assertIn(
+            "cluster-scoped RBAC left in place: dashboard-reader, node-reader", output
+        )
+        self.assertNotIn("could not check", output)
+
+    def test_external_credentials_are_never_created_or_deleted(self):
+        self.config["oidc"]["client_secret_secret"] = "admin-oidc"
+        self.config["oidc"]["ca_configmap"] = "admin-ca"
+        cluster = FakeCluster(self.load())
+        cluster.objects[("namespace", cluster.ns)] = {
+            "metadata": {"labels": {installer.OWNER: installer.OWNER_VALUE}}
+        }
+        cluster.objects[("secret", "admin-oidc")] = {
+            "data": {
+                "client-secret": base64.b64encode(b"s").decode(),
+                "cookie-secret": base64.b64encode(b"c").decode(),
+            }
+        }
+        cluster.objects[("configmap", "admin-ca")] = {"data": {"ca.crt": "ca"}}
+        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        self.assertNotIn(("secret", installer.OIDC_SECRET), cluster.objects)
+        self.assertNotIn(("configmap", installer.OIDC_CA), cluster.objects)
+        gateway, dashboard = installer.chart_values(cluster.config)
+        self.assertEqual(dashboard["oidc"]["existingSecret"], "admin-oidc")
+        self.assertEqual(gateway["server"]["oidc"]["caConfigMapName"], "admin-ca")
+        cluster.calls.clear()
+        _, error = self.uninstall(cluster)
+        self.assertIsNone(error)
+        self.assertIn(("secret", "admin-oidc"), cluster.objects)
+        self.assertIn(("configmap", "admin-ca"), cluster.objects)
+        self.assertNotIn(("configmap", installer.INSTALL_STATE), cluster.objects)
+
+    def test_external_secret_reusing_fixed_names_is_preserved(self):
+        self.config["oidc"]["client_secret_secret"] = installer.OIDC_SECRET
+        cluster = FakeCluster(self.load())
+        cluster.objects[("namespace", cluster.ns)] = {
+            "metadata": {"labels": {installer.OWNER: installer.OWNER_VALUE}}
+        }
+        secret = {
+            "data": {
+                "client-secret": base64.b64encode(b"s").decode(),
+                "cookie-secret": base64.b64encode(b"c").decode(),
+            }
+        }
+        cluster.objects[("secret", installer.OIDC_SECRET)] = copy.deepcopy(secret)
+        cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        self.assertEqual(cluster.objects[("secret", installer.OIDC_SECRET)], secret)
+        _, error = self.uninstall(cluster)
+        self.assertIsNone(error)
+        self.assertEqual(cluster.objects[("secret", installer.OIDC_SECRET)], secret)
+
+    def test_preflight_rejects_external_secret_missing_keys(self):
+        self.config["oidc"]["client_secret_secret"] = "admin-oidc"
+        cluster = FakeCluster(self.load())
+        cluster.objects[("namespace", cluster.ns)] = {"metadata": {}}
+        cluster.objects[("secret", "admin-oidc")] = {
+            "data": {"client-secret": base64.b64encode(b"s").decode()}
+        }
+        with self.assertRaisesRegex(ValueError, "cookie-secret"):
+            cluster.preflight()
+
+    def test_client_secret_file_and_secret_reference_are_mutually_exclusive(self):
+        self.config["oidc"]["client_secret_secret"] = "admin-oidc"
+        (self.root / "secret.txt").write_text("s")
+        self.config["oidc"]["client_secret_file"] = "secret.txt"
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            self.load()
+
+    # --- init ------------------------------------------------------------
+
+    def test_init_writes_the_fixed_file_set(self):
+        work = self.root / "work"
+        work.mkdir()
+        with self.working_directory(work):
+            output = self.init()
+        for name in (
+            "config.json",
+            "gateway-overrides.yaml",
+            "dashboard-overrides.yaml",
+        ):
+            path = work / name
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertIn("upstream chart images", output)
+        config = json.loads((work / "config.json").read_text())
+        self.assertNotIn("images", config["gateway"])
+        self.assertEqual(
+            config["gateway"]["version"], "REPLACE_WITH_EXACT_OPENSHELL_VERSION"
+        )
+        config["gateway"]["version"] = "0.1.3"
+        config["dashboard"]["version"] = "0.1.0"
+        (work / "dashboard-client-secret.txt").write_text("secret\n")
+        path = work / "config.json"
+        path.write_text(json.dumps(config))
+        loaded = installer.load_config(path)
+        self.assertEqual(
+            loaded["gateway"]["helm_overrides"], ["gateway-overrides.yaml"]
+        )
+
+    def test_init_refuses_to_overwrite_and_writes_nothing(self):
+        work = self.root / "work"
+        work.mkdir()
+        (work / "gateway-overrides.yaml").write_text("existing")
+        with (
+            self.working_directory(work),
+            self.assertRaisesRegex(ValueError, "already exists"),
+        ):
+            self.init()
+        self.assertEqual((work / "gateway-overrides.yaml").read_text(), "existing")
+        self.assertFalse((work / "config.json").exists())
+        self.assertFalse((work / "dashboard-overrides.yaml").exists())
+
+    def test_embedded_templates_match_the_example_files(self):
+        self.assertEqual(
+            installer.CONFIG_TEMPLATE,
+            Path(__file__).with_name("config.example.json").read_text(),
+        )
+        self.assertEqual(
+            installer.GATEWAY_OVERRIDES_TEMPLATE,
+            Path(__file__).with_name("gateway-overrides.example.yaml").read_text(),
+        )
+        self.assertEqual(
+            installer.DASHBOARD_OVERRIDES_TEMPLATE,
+            Path(__file__).with_name("dashboard-overrides.example.yaml").read_text(),
+        )
+
+    def test_init_flags_build_a_loadable_rhoai_config(self):
+        work = self.root / "work"
+        work.mkdir()
+        with self.working_directory(work):
+            self.init(
+                "--namespace",
+                "team-a",
+                "--cluster-app-domain",
+                "apps.example.com",
+                "--rhoai-version",
+                "3.6",
+                "--oidc-issuer",
+                "https://identity.example.com/realms/customer",
+            )
+        config = json.loads((work / "config.json").read_text())
+        self.assertEqual(config["namespace"], "team-a")
+        self.assertEqual(config["oidc"]["client_id"], "openshell-dashboard-team-a")
+        self.assertEqual(config["oidc"]["audience"], "openshell-api-team-a")
+        self.assertEqual(config["gateway"]["host"], "gateway-team-a.apps.example.com")
+        self.assertEqual(
+            config["dashboard"]["host"], "dashboard-team-a.apps.example.com"
+        )
+        self.assertEqual(config["gateway"]["version"], "0.1.3")
+        self.assertEqual(config["dashboard"]["version"], "0.1.0")
+        self.assertEqual(
+            config["gateway"]["images"]["gateway"]["repository"],
+            "rhoai/odh-openshell-gateway-rhel9",
+        )
+        self.assertEqual(
+            config["gateway"]["images"]["sandbox"]["repository"],
+            "registry.redhat.io/rhoai/odh-openshell-sandbox-rhel9",
+        )
+        self.assertEqual(
+            config["dashboard"]["images"]["authProxy"],
+            installer.AUTH_PROXY_IMAGE,
+        )
+        self.assertIn("rhoai-3.6", json.dumps(config["gateway"]["images"]))
+        (work / "dashboard-client-secret.txt").write_text("secret\n")
+        installer.load_config(work / "config.json")
+
+    def test_init_cluster_app_domain_derives_hosts_and_keeps_placeholders(self):
+        work = self.root / "work"
+        work.mkdir()
+        with self.working_directory(work):
+            self.init(
+                "--namespace", "team-a", "--cluster-app-domain", "apps.example.com"
+            )
+        config = json.loads((work / "config.json").read_text())
+        self.assertEqual(config["gateway"]["host"], "gateway-team-a.apps.example.com")
+        self.assertEqual(
+            config["dashboard"]["host"], "dashboard-team-a.apps.example.com"
+        )
+        self.assertTrue(config["gateway"]["version"].startswith("REPLACE_WITH"))
+
+    def test_init_explicit_hosts_override_derivation(self):
+        work = self.root / "work"
+        work.mkdir()
+        with self.working_directory(work):
+            self.init(
+                "--namespace",
+                "team-a",
+                "--cluster-app-domain",
+                "apps.example.com",
+                "--gateway-host",
+                "gw.example.com",
+                "--dashboard-host",
+                "dash.example.com",
+            )
+        config = json.loads((work / "config.json").read_text())
+        self.assertEqual(config["gateway"]["host"], "gw.example.com")
+        self.assertEqual(config["dashboard"]["host"], "dash.example.com")
+
+    def test_init_rejects_invalid_domains_and_versions_before_writing(self):
+        for flag, value in (
+            ("--cluster-app-domain", "https://apps.example.com"),
+            ("--cluster-app-domain", "apps.example.com:443"),
+            ("--cluster-app-domain", "apps.example.com/path"),
+            ("--cluster-app-domain", "*.apps.example.com"),
+            ("--cluster-app-domain", "apps..example.com"),
+            ("--cluster-app-domain", "apps.example.com."),
+            ("--openshell-version", "0.0.0"),
+            ("--openshell-version", ">=0.1.0"),
+            ("--openshell-version", "latest"),
+        ):
+            with self.subTest(flag=flag, value=value):
+                work = self.root / f"invalid-{abs(hash((flag, value)))}"
+                work.mkdir()
+                with (
+                    self.working_directory(work),
+                    self.assertRaises(ValueError),
+                ):
+                    self.init(flag, value)
+                self.assertFalse((work / "config.json").exists())
+
+    def test_init_long_namespace_requires_explicit_hosts(self):
+        namespace = "a" * 60
+        work = self.root / "long"
+        work.mkdir()
+        with (
+            self.working_directory(work),
+            self.assertRaisesRegex(ValueError, "exceeds 63"),
+        ):
+            self.init(
+                "--namespace",
+                namespace,
+                "--cluster-app-domain",
+                "apps.example.com",
+            )
+        self.assertFalse((work / "config.json").exists())
+        with self.working_directory(work):
+            self.init(
+                "--namespace",
+                namespace,
+                "--gateway-host",
+                "gw.example.com",
+                "--dashboard-host",
+                "dash.example.com",
+            )
+        self.assertTrue((work / "config.json").is_file())
+
+    def test_two_namespaces_cannot_share_derived_hosts(self):
+        hosts = []
+        for namespace in ("team-a", "team-b"):
+            work = self.root / namespace
+            work.mkdir()
+            with self.working_directory(work):
+                self.init(
+                    "--namespace",
+                    namespace,
+                    "--cluster-app-domain",
+                    "apps.example.com",
+                )
+            config = json.loads((work / "config.json").read_text())
+            hosts.append((config["gateway"]["host"], config["dashboard"]["host"]))
+        self.assertNotEqual(hosts[0], hosts[1])
+
+    def test_from_config_seeds_shared_identity_only(self):
+        source = self.root / "source"
+        source.mkdir()
+        (source / "ca.pem").write_text("ca")
+        oidc = {
+            "provider": "keycloak-oidc",
+            "issuer": "https://identity.example.com/realms/customer",
+            "ca_file": "ca.pem",
+            "client_id": "source-client",
+            "audience": "source-audience",
+            "roles_claim": "realm_access.roles",
+            "admin_role": "openshell-admin",
+            "user_role": "openshell-user",
+            "allowed_groups": ["source-group"],
+            "allowed_roles": ["openshell-admin", "openshell-user"],
+            "scope": "openid email profile",
+        }
+        (source / "config.json").write_text(json.dumps({"oidc": oidc}))
+        work = self.root / "team-b"
+        work.mkdir()
+        with self.working_directory(work):
+            self.init(
+                "--from-config",
+                str(source / "config.json"),
+                "--namespace",
+                "team-b",
+                "--cluster-app-domain",
+                "apps.example.com",
+            )
+        text = (work / "config.json").read_text()
+        config = json.loads(text)
+        self.assertEqual(config["oidc"]["provider"], "keycloak-oidc")
+        self.assertEqual(config["oidc"]["roles_claim"], "realm_access.roles")
+        self.assertEqual(config["oidc"]["scope"], "openid email profile")
+        self.assertEqual(config["oidc"]["ca_file"], str((source / "ca.pem").resolve()))
+        self.assertEqual(config["oidc"]["client_id"], "openshell-dashboard-team-b")
+        self.assertEqual(config["oidc"]["audience"], "openshell-api-team-b")
+        # Deployment-specific access assignments are not copied; the template's
+        # neutral empty lists remain.
+        self.assertEqual(config["oidc"]["allowed_groups"], [])
+        self.assertEqual(config["oidc"]["allowed_roles"], [])
+        self.assertNotEqual(config["oidc"]["client_id"], oidc["client_id"])
+        self.assertNotEqual(config["oidc"]["audience"], oidc["audience"])
+        # Self-contained: no reference to the source config remains (the CA is a
+        # copied absolute path to the administrator-managed file).
+        self.assertNotIn(str(source / "config.json"), text)
+
+    def test_from_config_rejects_a_source_missing_a_shared_key(self):
+        source = self.root / "source.json"
+        source.write_text(
+            json.dumps(
+                {"oidc": {"roles_claim": "roles", "admin_role": "a", "user_role": "u"}}
+            )
+        )
+        work = self.root / "work"
+        work.mkdir()
+        with (
+            self.working_directory(work),
+            self.assertRaisesRegex(ValueError, "Missing oidc.issuer"),
+        ):
+            self.init("--from-config", str(source))
+        self.assertFalse((work / "config.json").exists())
+
+    def test_from_config_and_inline_shared_flags_are_mutually_exclusive(self):
+        source = self.root / "source.json"
+        source.write_text("{}")
+        for flag in ("--oidc-issuer", "--oidc-ca-file", "--oidc-ca-configmap"):
+            work = self.root / f"mutual-{flag.strip('-')}"
+            work.mkdir()
+            with (
+                self.subTest(flag=flag),
+                self.working_directory(work),
+                self.assertRaisesRegex(ValueError, "combined"),
+            ):
+                self.init("--from-config", str(source), flag, "value")
+            self.assertFalse((work / "config.json").exists())
+
+    def test_inline_shared_flags_compose(self):
+        work = self.root / "work"
+        work.mkdir()
+        (work / "ca.pem").write_text("ca")
+        with self.working_directory(work):
+            self.init(
+                "--oidc-issuer",
+                "https://identity.example.com/realms/customer",
+                "--oidc-ca-file",
+                "ca.pem",
+            )
+        config = json.loads((work / "config.json").read_text())
+        self.assertEqual(
+            config["oidc"]["issuer"], "https://identity.example.com/realms/customer"
+        )
+        self.assertEqual(config["oidc"]["ca_file"], "ca.pem")
+
+    def test_explicit_chart_versions_compose(self):
+        work = self.root / "work"
+        work.mkdir()
+        with self.working_directory(work):
+            self.init(
+                "--openshell-version", "0.1.3", "--openshell-dashboard-version", "0.1.0"
+            )
+        config = json.loads((work / "config.json").read_text())
+        self.assertEqual(config["gateway"]["version"], "0.1.3")
+        self.assertEqual(config["dashboard"]["version"], "0.1.0")
+
+    def test_provider_neutrality(self):
+        self.config["oidc"]["provider"] = "keycloak-oidc"
+        self.config["oidc"]["allowed_groups"] = ["group"]
+        self.config["oidc"]["allowed_roles"] = ["role"]
+        loaded = self.load()
+        self.assertEqual(loaded["oidc"]["allowed_groups"], ["group"])
+        self.assertEqual(loaded["oidc"]["allowed_roles"], ["role"])
+        self.assertEqual(loaded["oidc"]["roles_claim"], "roles")
+        self.config["oidc"]["provider"] = "oidc"
+        with self.assertRaisesRegex(ValueError, "allowed_groups"):
+            self.load()
+
+    # --- RHOAI profiles --------------------------------------------------
+
+    @staticmethod
+    def synthetic_profile(**overrides):
+        profile = {
+            "aliases": (),
+            "gateway_chart": "oci://example.test/gateway",
+            "gateway_version": "9.9.9",
+            "dashboard_chart": "oci://example.test/dashboard",
+            "dashboard_version": "8.8.8",
+            "image_tag": "rhoai-ea",
+            "prerelease": True,
+            "images_qualified": False,
+        }
+        profile.update(overrides)
+        return profile
+
+    def test_36_alias_resolves_to_the_ga_profile(self):
+        canonical, profile = installer.resolve_profile("3.6")
+        self.assertEqual(canonical, "3.6.0")
+        self.assertEqual(profile["gateway_version"], "0.1.3")
+        self.assertEqual(profile["dashboard_version"], "0.1.0")
+        self.assertEqual(profile["image_tag"], "rhoai-3.6")
+
+    def test_synthetic_ea_profile_resolves_and_rejects_a_bare_line(self):
+        with patch.dict(
+            installer.RHOAI_PROFILES,
+            {"3.7.0-ea1": self.synthetic_profile()},
+            clear=False,
+        ):
+            canonical, profile = installer.resolve_profile("3.7.0-EA1")
+            self.assertEqual(canonical, "3.7.0-ea1")
+            self.assertTrue(profile["prerelease"])
+            with self.assertRaisesRegex(ValueError, "supported"):
+                installer.resolve_profile("3.7")
+            with self.assertRaisesRegex(ValueError, "supported"):
+                installer.resolve_profile("3.7.1")
+            installer.RHOAI_PROFILES["3.7.0"] = self.synthetic_profile(
+                aliases=("3.7",), prerelease=False
+            )
+            canonical, profile = installer.resolve_profile("3.7")
+            self.assertEqual(canonical, "3.7.0")
+            self.assertFalse(profile["prerelease"])
+
+    def test_unknown_release_fails_before_writing(self):
+        work = self.root / "work"
+        work.mkdir()
+        with (
+            self.working_directory(work),
+            self.assertRaisesRegex(ValueError, "supported"),
+        ):
+            self.init("--rhoai-version", "3.7")
+        self.assertFalse((work / "config.json").exists())
+
+    def test_profile_and_explicit_versions_are_mutually_exclusive(self):
+        for flag in ("--openshell-version", "--openshell-dashboard-version"):
+            work = self.root / f"exclusive-{flag.strip('-')}"
+            work.mkdir()
+            with (
+                self.subTest(flag=flag),
+                self.working_directory(work),
+                self.assertRaisesRegex(ValueError, "combined"),
+            ):
+                self.init("--rhoai-version", "3.6", flag, "0.1.3")
+            self.assertFalse((work / "config.json").exists())
+
+    def test_unqualified_profile_warns_and_qualified_does_not(self):
+        work = self.root / "work"
+        work.mkdir()
+        with self.working_directory(work):
+            output = self.init("--rhoai-version", "3.6")
+        self.assertIn("not been validated", output)
+        qualified = self.root / "qualified"
+        qualified.mkdir()
+        with (
+            patch.dict(
+                installer.RHOAI_PROFILES,
+                {
+                    "3.6.0": dict(
+                        installer.RHOAI_PROFILES["3.6.0"], images_qualified=True
+                    )
+                },
+            ),
+            self.working_directory(qualified),
+        ):
+            output = self.init("--rhoai-version", "3.6")
+        self.assertNotIn("not been validated", output)
+
+    def test_profiles_embed_no_image_digests(self):
+        for key, profile in installer.RHOAI_PROFILES.items():
+            with self.subTest(profile=key):
+                self.assertNotIn("sha256:", json.dumps(profile))
+                self.assertNotIn("digest", json.dumps(profile))
+
+    def test_readme_compatibility_table_matches_the_profiles(self):
+        readme = Path(__file__).with_name("README.md").read_text()
+        for key, profile in installer.RHOAI_PROFILES.items():
+            with self.subTest(profile=key):
+                self.assertIn(f"`{key}`", readme)
+                self.assertIn(profile["gateway_version"], readme)
+                self.assertIn(profile["dashboard_version"], readme)
+                self.assertIn(f"`{profile['image_tag']}`", readme)
+                alias = profile["aliases"][0]
+                self.assertIn(f"--rhoai-version {alias}", readme)
+                self.assertIn(profile["gateway_chart"], readme)
+
+    # --- RHOAI image verification ---------------------------------------
+
+    def rhoai_cluster(self):
+        self.config = configuration()
+        installer.apply_profile(self.config, installer.RHOAI_PROFILES["3.6.0"])
+        return self.cluster()
+
+    @staticmethod
+    def pin_digests(config):
+        for name, component, _ in installer.RHOAI_IMAGE_COMPONENTS:
+            image = config[name]["images"][component]
+            image["digest"] = f"sha256:{name}{component}"[:71]
+
+    @staticmethod
+    def csv_for(config):
+        related = []
+        for name, component, mapped in installer.RHOAI_IMAGE_COMPONENTS:
+            image = config[name]["images"][component]
+            repository = installer.image_repository(image)
+            related.append(
+                {
+                    "name": mapped,
+                    "image": f"{repository}@{image['digest']}",
+                }
+            )
+        return [
+            {
+                "metadata": {"name": "rhods-operator.v3.6.0"},
+                "spec": {"relatedImages": related},
+            }
+        ]
+
+    def test_preflight_rejects_csv_digest_and_repository_mismatches(self):
+        for field, value in (
+            ("digest", "sha256:mismatch"),
+            ("registry", "quay.io"),
+        ):
+            with self.subTest(field=field):
+                cluster = self.rhoai_cluster()
+                self.pin_digests(cluster.config)
+                cluster.csvs = self.csv_for(cluster.config)
+                cluster.config["gateway"]["images"]["gateway"][field] = value
+                cluster.calls.clear()
+                with self.assertRaises(ValueError):
+                    cluster.preflight()
+                self.assertFalse(
+                    any(args[:2] == ["helm", "upgrade"] for args, _ in cluster.calls)
+                )
+
+    def test_preflight_warns_when_skopeo_is_unavailable(self):
+        cluster = self.rhoai_cluster()
+        self.pin_digests(cluster.config)
+        cluster.csvs = self.csv_for(cluster.config)
+        for name, component, _ in installer.RHOAI_IMAGE_COMPONENTS:
+            cluster.config[name]["images"][component].pop("digest")
+        with (
+            patch.object(
+                installer.shutil,
+                "which",
+                side_effect=lambda tool: None if tool == "skopeo" else tool,
+            ),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            cluster.preflight()
+        self.assertIn("skopeo is not installed", output.getvalue())
+
+    def test_preflight_warns_and_continues_without_an_rhoai_csv(self):
+        cluster = self.rhoai_cluster()
+        self.pin_digests(cluster.config)
+        cluster.csvs = []
+        with redirect_stdout(io.StringIO()) as output:
+            cluster.preflight()
+        self.assertIn("product images were not verified", output.getvalue())
+
+    def test_validate_performs_no_csv_lookup(self):
+        path = self.root / "config.json"
+        self.config = configuration()
+        installer.apply_profile(self.config, installer.RHOAI_PROFILES["3.6.0"])
+        path.write_text(json.dumps(self.config))
+        commands = []
+
+        def run(_instance, args, _payload=None):
+            commands.append(args)
+            if args[:2] == ["helm", "pull"]:
+                (Path(args[args.index("--destination") + 1]) / "chart.tgz").write_bytes(
+                    b"fake"
+                )
+            return ""
+
+        with (
+            patch("sys.argv", ["install.py", "validate", "--config", str(path)]),
+            patch.object(installer.shutil, "which", return_value="tool"),
+            patch.object(installer.Installer, "run", run),
+        ):
+            installer.main()
+        self.assertFalse(any("csv" in args for args in commands))
+
+    # --- preflight host isolation ---------------------------------------
+
+    def test_preflight_rejects_a_host_claimed_in_another_namespace(self):
+        cluster = self.cluster()
+        host = cluster.config["gateway"]["host"]
+        cluster.routes = [
+            {
+                "metadata": {"name": "foreign", "namespace": "other-team"},
+                "spec": {"host": host},
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "other-team") as caught:
+            cluster.preflight()
+        self.assertIn(host, str(caught.exception))
+        self.assertFalse(
+            any(args[:2] == ["helm", "upgrade"] for args, _ in cluster.calls)
+        )
+
+    def test_failed_dashboard_upgrade_preserves_state(self):
+        cluster = self.cluster()
+        cluster.fail_dashboard = True
+        with self.assertRaisesRegex(RuntimeError, "dashboard failed"):
+            cluster.install(["g.tgz", "d.tgz"], ["g.json", "d.json"])
+        self.assertIn(("configmap", installer.INSTALL_STATE), cluster.objects)
+        self.assertEqual(
+            {release["name"] for release in cluster.releases}, {"openshell"}
+        )
 
 
 if __name__ == "__main__":

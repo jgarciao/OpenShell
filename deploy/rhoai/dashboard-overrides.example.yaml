@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 OpenShell contributors
 # SPDX-License-Identifier: Apache-2.0
-# Optional operational overrides, referenced by dashboard.values_files.
+# Optional operational overrides, loaded through dashboard.helm_overrides.
 resources:
   requests:
     cpu: 100m
