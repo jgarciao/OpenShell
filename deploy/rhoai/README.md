@@ -177,7 +177,10 @@ the validation evidence with the operator CSV version, not in the installer. Pin
 a digest per installation with `images.*.digest` when immutability is required.
 `preflight` compares the configured images with the cluster's `rhods-operator`
 CSV and fails on a repository or digest mismatch. When RHOAI is absent or a tag
-cannot be resolved, it warns and continues.
+cannot be resolved, it warns and continues. To verify a tag's digest, `skopeo`
+must be on `PATH` and authorized for `registry.redhat.io`
+(`skopeo login registry.redhat.io`); otherwise preflight still checks
+repositories and reports that digests were not verified.
 
 ## Configuration
 

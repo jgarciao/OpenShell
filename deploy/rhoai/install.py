@@ -581,6 +581,22 @@ def image_repository(image):
     return f"{registry}/{repository}" if registry else repository
 
 
+def related_image_name(name):
+    """Normalize a CSV relatedImage name to ODH_OPENSHELL_<COMPONENT>_IMAGE.
+
+    RHOAI CSVs use different spellings: `RELATED_IMAGE_ODH_OPENSHELL_GATEWAY_IMAGE`
+    in one build and `odh_openshell_gateway_image` in another. Normalize case,
+    separators, and the optional prefix before comparing.
+    """
+    return (
+        str(name)
+        .upper()
+        .replace("-", "_")
+        .replace(".", "_")
+        .removeprefix("RELATED_IMAGE_")
+    )
+
+
 def split_image(reference):
     """Return (repository, digest-or-tag) for a full image reference."""
     if "@" in reference:
@@ -599,6 +615,18 @@ class Installer:
         self.context_args = ["--context", context] if context else []
         self.kube = ["kubectl", *self.context_args, "--request-timeout=30s"]
         self.ns = config["namespace"]
+        self.warnings = []
+        self.passed = 0
+
+    def section(self, title):
+        print(f"\n{title}")
+
+    def emit(self, level, message):
+        print(f"  [{level}] {message}")
+        if level == "ok":
+            self.passed += 1
+        elif level == "warn":
+            self.warnings.append(message)
 
     def helm_args(self, *args):
         # Single choke point for cluster-facing helm calls. helm pull and
@@ -729,8 +757,15 @@ class Installer:
 
     def cluster_checks(self, namespace):
         version = self.get("clusterversion.config.openshift.io", "version", False)
-        print(
-            f"OpenShift: {(version or {}).get('status', {}).get('desired', {}).get('version', 'unknown')}"
+        self.emit(
+            "ok",
+            "OpenShift "
+            + str(
+                (version or {})
+                .get("status", {})
+                .get("desired", {})
+                .get("version", "unknown")
+            ),
         )
         storage = json.loads(
             self.run([*self.kube, "get", "storageclasses", "-o", "json"])
@@ -750,8 +785,10 @@ class Installer:
             defaults,
             "No default StorageClass; the gateway chart's SQLite PVC requires one",
         )
-        print(
-            f"Default storage: {', '.join(defaults)} (verify block-backed SQLite storage)"
+        self.emit("ok", f"Default StorageClass: {', '.join(defaults)}")
+        self.emit(
+            "info",
+            "Use block-backed storage for the gateway SQLite PVC.",
         )
         custom = (
             self.config["gateway"]
@@ -764,6 +801,7 @@ class Installer:
                 any(item["metadata"]["name"] == custom for item in storage["items"]),
                 "Configured workspaceStorageClass does not exist",
             )
+            self.emit("ok", f"Workspace StorageClass exists: {custom}")
         nodes = json.loads(self.run([*self.kube, "get", "nodes", "-o", "json"]))
         kernels = sorted(
             {
@@ -773,14 +811,16 @@ class Installer:
                 for item in nodes["items"]
             }
         )
-        print(f"Node kernels: {', '.join(kernels) or 'none reported'}")
+        self.emit("info", f"Node kernels: {', '.join(kernels) or 'none reported'}")
         if any(
             (match := re.match(r"(\d+)\.(\d+)", kernel))
             and tuple(map(int, match.groups())) < (5, 19)
             for kernel in kernels
         ):
-            print(
-                "Note: kernels before 5.19 need an OpenShell build with the legacy-kernel fixes; verify sandbox networking."
+            self.emit(
+                "info",
+                "Kernels before 5.19 need a build with the legacy-kernel fixes. "
+                "No action is required unless sandbox networking fails.",
             )
         # Check actual installation operations instead of requiring wildcard
         # cluster-admin. These checks cannot prove RBAC bind/escalate or SCC admission.
@@ -833,6 +873,7 @@ class Installer:
                     f"Preflight permission check failed: {verb} {resource}"
                     + (f" in {self.ns}" if namespaced else " cluster-wide")
                 ) from None
+        self.emit("ok", f"Installation permissions checked ({len(operations)})")
 
     def check_route_hosts(self):
         # A host claimed in another namespace fails at Route admission, after
@@ -852,6 +893,7 @@ class Installer:
                     f"Host {desired} is already claimed by Route "
                     f"{route.get('metadata', {}).get('name')} in namespace {owner}",
                 )
+        self.emit("ok", "Route hosts are not claimed by another namespace")
 
     def installed_images(self):
         return [
@@ -862,28 +904,35 @@ class Installer:
     def verify_rhoai_images(self):
         configured = [item for item in self.installed_images() if item[2]]
         if not configured:
+            self.emit(
+                "info",
+                "No product images configured; the charts' upstream defaults will be used.",
+            )
             return
         namespace = self.config.get("rhods_operator_namespace", "redhat-ods-operator")
         try:
             output = self.run([*self.kube, "-n", namespace, "get", "csv", "-o", "json"])
         except (RuntimeError, ValueError):
-            print(
-                "Warning: cannot read the RHOAI operator CSV; product images were "
-                "not verified against this cluster's operator build."
+            self.emit(
+                "warn",
+                "Cannot read the RHOAI operator CSV; product images were not "
+                "verified against this cluster's operator build.",
             )
             return
         csvs = [
             item
             for item in json.loads(output).get("items", [])
             if any(
-                str(related.get("name", "")).startswith("RELATED_IMAGE_ODH_OPENSHELL_")
+                "OPENSHELL" in related_image_name(related.get("name", ""))
+                and related_image_name(related.get("name", "")).endswith("_IMAGE")
                 for related in item.get("spec", {}).get("relatedImages", [])
             )
         ]
         if not csvs:
-            print(
-                "Warning: no RHOAI operator CSV declaring OpenShell images was found "
-                f"in namespace {namespace}; product images were not verified."
+            self.emit(
+                "warn",
+                f"No RHOAI operator CSV found in {namespace}; product images were "
+                "not verified.",
             )
             return
         require(
@@ -891,17 +940,22 @@ class Installer:
             "More than one OpenShell-bearing CSV in "
             f"{namespace}: {', '.join(item['metadata']['name'] for item in csvs)}",
         )
+        csv_name = csvs[0]["metadata"]["name"]
         declared = {
-            related.get("name"): related.get("image", "")
+            related_image_name(related.get("name", "")): related.get("image", "")
             for related in csvs[0].get("spec", {}).get("relatedImages", [])
         }
+        unresolved = []
+        skopeo = shutil.which("skopeo")
+        unauthorized = False
         for name, component, mapped in RHOAI_IMAGE_COMPONENTS:
             image = self.config[name].get("images", {}).get(component)
             if not image:
                 continue
-            reference = declared.get(mapped)
+            key = related_image_name(mapped)
+            reference = declared.get(key)
             if not reference:
-                print(f"Warning: the RHOAI CSV does not declare {mapped}")
+                self.emit("warn", f"The RHOAI CSV does not declare {mapped}")
                 continue
             expected_repository, expected_digest = split_image(reference)
             repository = image_repository(image)
@@ -911,9 +965,10 @@ class Installer:
                 f"the RHOAI operator CSV image {expected_repository}",
             )
             if not expected_digest:
-                print(
-                    f"Warning: the RHOAI CSV declares no digest for {mapped}; "
-                    f"{repository} was not verified."
+                self.emit(
+                    "warn",
+                    f"The RHOAI CSV declares no digest for {mapped}; "
+                    f"{repository} was not verified.",
                 )
                 continue
             if image.get("digest"):
@@ -926,11 +981,8 @@ class Installer:
             require(
                 image.get("tag"), f"{name}.images.{component} needs a tag or digest"
             )
-            if not shutil.which("skopeo"):
-                print(
-                    f"Warning: skopeo is not installed; cannot verify the digest of "
-                    f"{repository}:{image['tag']} against the RHOAI operator CSV."
-                )
+            if not skopeo:
+                unresolved.append(f"{repository}:{image['tag']}")
                 continue
             result = subprocess.run(
                 ["skopeo", "inspect", f"docker://{repository}:{image['tag']}"],
@@ -943,17 +995,36 @@ class Installer:
             except json.JSONDecodeError:
                 resolved = None
             if result.returncode or not resolved:
-                print(
-                    f"Warning: cannot resolve {repository}:{image['tag']}; its digest "
-                    "was not verified against the RHOAI operator CSV."
+                unauthorized = (
+                    unauthorized or "unauthorized" in (result.stderr or "").lower()
                 )
+                unresolved.append(f"{repository}:{image['tag']}")
                 continue
             require(
                 resolved == expected_digest,
                 f"{name}.images.{component} tag {image['tag']} resolves to {resolved}; "
                 f"the RHOAI operator CSV declares {expected_digest}",
             )
-        print("RHOAI product images match the operator CSV.")
+        self.emit(
+            "ok",
+            f"Product image repositories match the RHOAI operator CSV ({csv_name})",
+        )
+        if unresolved:
+            if not skopeo:
+                reason = "skopeo is not installed"
+                remedy = "install skopeo to verify tag digests"
+            elif unauthorized:
+                reason = "skopeo is not authorized by the registry"
+                remedy = "run `skopeo login registry.redhat.io`"
+            else:
+                reason = "skopeo could not resolve the tags"
+                remedy = "check registry access"
+            self.emit(
+                "warn",
+                f"Digests of {len(unresolved)} tag-based image(s) were not verified "
+                f"({reason}). Repositories matched the operator CSV. To verify "
+                f"digests, {remedy} or pin images.*.digest.",
+            )
 
     def identity_state(self):
         oidc = self.config["oidc"]
@@ -1016,15 +1087,40 @@ class Installer:
                 )
 
     def preflight(self):
+        self.warnings = []
+        self.passed = 0
+        print(f"Preflight for namespace {self.ns}")
+        self.section("Cluster")
         self.run([*self.kube, "get", "--raw", "/apis/route.openshift.io/v1"])
-        crd = self.get("crd", "sandboxes.agents.x-k8s.io", False)
+        self.emit("ok", "OpenShift Route API is available")
+        namespace = self.get("namespace", self.ns, False)
         require(
-            crd
-            and any(
-                v["served"] and v["name"] in ("v1alpha1", "v1beta1")
-                for v in crd["spec"]["versions"]
-            ),
+            not namespace or namespace.get("status", {}).get("phase") != "Terminating",
+            "Namespace is terminating",
+        )
+        if namespace:
+            self.emit("ok", f"Namespace {self.ns} exists")
+        else:
+            self.emit(
+                "info",
+                f"Namespace {self.ns} does not exist yet; install will create it",
+            )
+        self.cluster_checks(namespace)
+
+        self.section("Agent Sandbox")
+        crd = self.get("crd", "sandboxes.agents.x-k8s.io", False)
+        served = [
+            v["name"]
+            for v in (crd or {}).get("spec", {}).get("versions", [])
+            if v["served"]
+        ]
+        require(
+            any(name in ("v1alpha1", "v1beta1") for name in served),
             "Install the Agent Sandbox CRDs and controller first",
+        )
+        self.emit("ok", f"Agent Sandbox CRD is served ({', '.join(served)})")
+        controller = self.config.get(
+            "agent_sandbox_deployment", "agent-sandbox-controller"
         )
         self.run(
             [
@@ -1033,22 +1129,18 @@ class Installer:
                 self.config.get("agent_sandbox_namespace", "agent-sandbox-system"),
                 "rollout",
                 "status",
-                "deployment/"
-                + self.config.get(
-                    "agent_sandbox_deployment", "agent-sandbox-controller"
-                ),
+                "deployment/" + controller,
                 "--timeout",
                 self.timeout,
             ]
         )
-        namespace = self.get("namespace", self.ns, False)
-        require(
-            not namespace or namespace.get("status", {}).get("phase") != "Terminating",
-            "Namespace is terminating",
-        )
-        self.cluster_checks(namespace)
-        self.check_route_hosts()
+        self.emit("ok", f"Agent Sandbox controller {controller} is ready")
+
+        self.section("RHOAI product images")
         self.verify_rhoai_images()
+
+        self.section("Installer state, identity, and networking")
+        self.check_route_hosts()
         state = self.get("configmap", INSTALL_STATE) if namespace else None
         require(
             not state or state["metadata"].get("labels", {}).get(OWNER) == OWNER_VALUE,
@@ -1070,9 +1162,13 @@ class Installer:
             or original_host == self.config["gateway"]["host"],
             "Gateway hostname differs from the original install; certificate migration is required",
         )
+        if state or legacy_host:
+            self.emit("ok", "Existing installer state matches this configuration")
         self.check_identity(state)
+        self.emit("ok", "OIDC identity is distinct from other installations")
         if namespace:
             self.check_releases(managed=bool(state or legacy_host))
+            self.emit("ok", "No conflicting Helm releases in the namespace")
             # The chart's bootstrap hook reuses existing TLS material. Do not
             # accidentally use certificates belonging to another gateway.
             if not (state or legacy_host):
@@ -1081,6 +1177,7 @@ class Installer:
                         not self.get("secret", secret),
                         f"Existing gateway Secret {secret} requires explicit migration",
                     )
+                self.emit("ok", "No pre-existing gateway TLS Secrets")
         oidc = self.config["oidc"]
         require(
             state
@@ -1091,6 +1188,11 @@ class Installer:
             "the first install",
         )
         self.credentials(check_only=True, namespace_exists=bool(namespace))
+        self.emit("ok", "Client credentials are valid")
+        print(
+            f"\nPreflight checks: {self.passed} passed, "
+            f"{len(self.warnings)} warning(s)."
+        )
         return namespace
 
     def credentials(self, check_only=False, *, namespace_exists=True):
@@ -2066,7 +2168,14 @@ def preflight_command(args):
     with tempfile.TemporaryDirectory(prefix="openshell-install-") as temporary:
         render_charts(installer, config, Path(temporary), (None, None))
     installer.preflight()
-    print("Cluster preflight passed; no installation resources were changed.")
+    if installer.warnings:
+        print(
+            "\nPreflight passed with warnings; no cluster resources were changed. "
+            "Review the warnings above before installing."
+        )
+    else:
+        print("\nPreflight passed; no cluster resources were changed.")
+    print("Next: ./install.py install")
 
 
 def install_command(args):
@@ -2128,12 +2237,12 @@ if __name__ == "__main__":
             None,
         )
         label = {
-            "init": "Initialization stopped",
-            "validate": "Validation stopped",
-            "preflight": "Preflight stopped",
-            "install": "Installation stopped",
-            "uninstall": "Uninstall stopped",
-        }.get(command, "Stopped")
+            "init": "Initialization failed",
+            "validate": "Validation failed",
+            "preflight": "Preflight failed",
+            "install": "Installation failed",
+            "uninstall": "Uninstall failed",
+        }.get(command, "Failed")
         detail = ""
         if command == "install":
             detail = "\nCluster resources were not rolled back or deleted."

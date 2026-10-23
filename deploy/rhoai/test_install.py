@@ -51,6 +51,7 @@ class FakeCluster(installer.Installer):
         self.csvs = []
         self.routes = []
         self.cluster_rbac = []
+        self.nodes = []
         self.storage = [
             {
                 "metadata": {
@@ -100,7 +101,7 @@ class FakeCluster(installer.Installer):
         if "storageclasses" in args:
             return json.dumps({"items": self.storage})
         if "nodes" in args:
-            return json.dumps({"items": []})
+            return json.dumps({"items": self.nodes})
         if "--all-namespaces" in args:
             return json.dumps({"items": self.other_states})
         if any(arg.startswith("clusterroles") for arg in args) and "-l" in args:
@@ -2011,14 +2012,20 @@ class InstallTests(unittest.TestCase):
             image["digest"] = f"sha256:{name}{component}"[:71]
 
     @staticmethod
-    def csv_for(config):
+    def csv_for(config, lowercase=False):
         related = []
         for name, component, mapped in installer.RHOAI_IMAGE_COMPONENTS:
             image = config[name]["images"][component]
             repository = installer.image_repository(image)
             related.append(
                 {
-                    "name": mapped,
+                    # RHOAI CSVs spell related-image names differently:
+                    # RELATED_IMAGE_ODH_... in one build, odh_..._image in another.
+                    "name": (
+                        installer.related_image_name(mapped).lower()
+                        if lowercase
+                        else mapped
+                    ),
                     "image": f"{repository}@{image['digest']}",
                 }
             )
@@ -2045,6 +2052,34 @@ class InstallTests(unittest.TestCase):
                 self.assertFalse(
                     any(args[:2] == ["helm", "upgrade"] for args, _ in cluster.calls)
                 )
+
+    def test_preflight_accepts_lowercase_csv_related_image_names(self):
+        cluster = self.rhoai_cluster()
+        self.pin_digests(cluster.config)
+        cluster.csvs = self.csv_for(cluster.config, lowercase=True)
+        with redirect_stdout(io.StringIO()) as output:
+            cluster.preflight()
+        text = output.getvalue()
+        self.assertIn("Product image repositories match the RHOAI operator CSV", text)
+        self.assertIn("Preflight checks:", text)
+
+    def test_preflight_kernel_note_is_informational(self):
+        cluster = self.cluster()
+        cluster.nodes = [
+            {"status": {"nodeInfo": {"kernelVersion": "5.14.0-687.el9.x86_64"}}}
+        ]
+        with redirect_stdout(io.StringIO()) as output:
+            cluster.preflight()
+        text = output.getvalue()
+        self.assertIn("No action is required", text)
+        self.assertIn("[info] Node kernels: 5.14.0-687.el9.x86_64", text)
+
+    def test_preflight_summary_counts_passed_checks_and_warnings(self):
+        cluster = self.cluster()
+        with redirect_stdout(io.StringIO()) as output:
+            cluster.preflight()
+        self.assertIn("Preflight checks:", output.getvalue())
+        self.assertIn("0 warning(s)", output.getvalue())
 
     def test_preflight_warns_when_skopeo_is_unavailable(self):
         cluster = self.rhoai_cluster()
